@@ -1,0 +1,8 @@
+torch
+numpy
+onnx
+onnxruntime
+Pillow
+requests
+tqdm
+datasets

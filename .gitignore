@@ -1,0 +1,14 @@
+# 排除權重與日誌
+checkpoints_*/
+*.pt
+*.log
+
+# 排除數據與圖片
+data/
+*.jpg
+*.png
+*.cnz
+
+# 排除 Python 緩存
+__pycache__/
+*.pyc
