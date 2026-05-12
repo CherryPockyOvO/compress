@@ -155,8 +155,9 @@ python train.py \
 
 The `detail` preset expands to `lambda=0.013`, `ssim_weight=0.35`,
 `detail_weight=0.12`, `l1_weight=0.03`, `quant_step=0.50`, `crop_size=384`,
-`batch_size=2`, `lr=3e-5`, and `epochs=80`. Override any of these on the command
-line if your GPU memory or target bitrate needs a different tradeoff.
+`batch_size=64`, `lr=3e-5`, and `epochs=80`. The balanced preset uses
+`batch_size=128` with `crop_size=256`. Override any of these on the command line
+if your GPU memory or target bitrate needs a different tradeoff.
 
 Export and deploy the high-precision level from the new checkpoint directory:
 
