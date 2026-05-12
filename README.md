@@ -1,9 +1,8 @@
 # compressai-nano
 
-`compressai-nano` is a stripped-down FactorizedPrior-style image compression
+`compress` is a stripped-down FactorizedPrior-style image compression
 project derived from the CompressAI model layout. It keeps only the pieces
-needed for a single-image three-level codec and fixed-shape RK3588-friendly
-ONNX export.
+needed for a single-image codec and fixed-shape RK3588-friendly ONNX export.
 
 The current architecture is asymmetric: RK3588 only runs the encoder, while the
 PC runs the heavier residual decoder for better reconstruction quality.
@@ -11,15 +10,18 @@ PC runs the heavier residual decoder for better reconstruction quality.
 ## Directory Tree
 
 ```text
-compressai-nano/
+compress/
 |-- README.md
 |-- requirements.txt
-|-- export_onnx.py
-|-- demo_codec.py
 |-- encode_image.py
-|-- decode_image.py
+|-- decode_cnz.py
+|-- tools/
+|-- cpp/
+|-- tests/
+|-- legacy/
 `-- compressai_nano/
     |-- __init__.py
+    |-- cnz.py
     |-- entropy.py
     |-- layers.py
     `-- models.py
@@ -32,58 +34,61 @@ compressai-nano/
 - GDN/IGDN blocks are replaced by `BatchNorm2d + ReLU`.
 - The decoder is a PC-side residual reconstruction network and is intentionally
   heavier than the encoder.
-- Three quality levels are exposed through `quality_level=1,2,3`.
+- The old three-level interface has been removed. This project now keeps only
+  the former level-3 high-quality configuration.
 - Encoder and decoder are separate modules for ONNX export.
 - The CPU entropy path is a small pure Python/PyTorch symbol codec. It is meant
   for runnable prototyping; use a trained CDF/rANS implementation for production
   bitstreams.
 
-## Quality Levels
+## Model Configuration
 
 ```python
 from compressai_nano import FactorizedPriorNano
 
-model_q1 = FactorizedPriorNano(quality_level=1)  # lowest bitrate, coarser symbols
-model_q2 = FactorizedPriorNano(quality_level=2)  # balanced default
-model_q3 = FactorizedPriorNano(quality_level=3)  # finer symbols, higher bitrate
+model = FactorizedPriorNano()
 ```
 
-All three levels keep the RK3588 encoder at `N=128, M=128`. Higher quality
-levels use a finer latent quantization step and a stronger PC-side decoder.
-Train each level separately before using the codec for real image quality.
+The single retained configuration uses `N=128, M=128`, `quant_step=0.67`,
+`decoder_channels=256`, `decoder_res_blocks=3`, and `refinement_blocks=5`.
+Old lower-quality checkpoints are not useful for this code path. Old level-3
+checkpoints can still be loaded manually with `--resume` or `--checkpoint`.
 
-## Export ONNX
+## Export Encoder ONNX
 
 From this directory:
 
 ```powershell
-python export_onnx.py --quality-level 2 --height 256 --width 256 --output-dir onnx_models
+python tools/export_encoder_onnx.py --checkpoint checkpoints/latest.pt --output encoder.onnx --height 720 --width 1280
 ```
 
-This writes:
+This writes the RK3588-side encoder model:
 
 ```text
-onnx_models/encoder.onnx
-onnx_models/decoder.onnx
+encoder.onnx
 ```
 
-The encoder input is fixed to `(1, 3, 256, 256)`. The decoder input is fixed to
-the latent tensor shape produced by the encoder, `(1, 128, 16, 16)` for 256x256.
+The PC-side decoder stays in PyTorch. The old full encoder+decoder ONNX export
+script is archived under `legacy/`.
 
-Use a checkpoint when you have trained weights:
+## Single Image PC Run
 
 ```powershell
-python export_onnx.py --quality-level 2 --checkpoint checkpoints/q2.pth --output-dir onnx_models
+python encode_image.py path\to\image.png --checkpoint checkpoints\latest.pt --output stream.cnz
+python decode_cnz.py stream.cnz --checkpoint checkpoints\latest.pt --output recon.png
 ```
 
-## Single Image Smoke Run
+## C++ CNZ Roundtrip
 
-```powershell
-python demo_codec.py path\to\image.png --quality-level 2 --output recon.png
+```bash
+cpp/scripts/cpp_roundtrip_test.sh \
+  --latent latent.bin \
+  --params entropy_params.json \
+  --cnz test.cnz \
+  --yhat y_hat.bin
 ```
 
-Without a trained checkpoint, the script validates the codec path but the
-reconstruction will not be meaningful.
+This tests the C++ deployment path: `latent.bin -> CNZ4 -> y_hat.bin`.
 
 ## Train And Validate
 
@@ -99,20 +104,219 @@ Prepare a larger mixed 5000-image compression dataset:
 python expand_dataset.py --count 5000 --threads 12
 ```
 
+Add high-resolution detail patches from DIV2K/Flickr2K, with COCO as a fallback
+source when more images are needed:
+
 ```powershell
-python train.py --train-dir data\train --val-dir data\val --quality-level 2 --epochs 150 --batch-size 4 --num-workers 4 --lr 1e-4 --ssim-weight 0.2
-python val.py --data-dir D:\data\images\test --checkpoint checkpoints\q2_latest.pt --results-dir results
+python expand_hq_dataset.py --output-dir data --target-count 30000
+```
+
+On mainland China servers, avoid full dataset snapshots when possible. Download
+only the HR files from ModelScope, then import the local folder:
+
+```bash
+modelscope download --dataset OmniData/DIV2K --local_dir ./data/_raw_hq/modelscope_div2k_hr --include "*DIV2K_train_HR*" "*DIV2K_valid_HR*"
+python expand_hq_dataset.py --output-dir data --target-count 30000 --local-inputs ./data/_raw_hq/modelscope_div2k_hr --patches-per-local 24 --skip-remote-downloads
+```
+
+If you want to use COCO from a mainland China mirror instead of the official
+COCO host:
+
+```bash
+pip install -U modelscope
+python expand_hq_dataset.py --output-dir data --target-count 30000 --download-coco-cn --patch-size 384 --min-size 384 --skip-remote-downloads
+```
+
+If the ModelScope CLI reports `0 files`, the script falls back to
+`MsDataset.load("COCO2017_Instance_Segmentation", split="subtrain"/"validation")`.
+
+```powershell
+python train.py --train-dir data\train --val-dir data\val --epochs 150 --batch-size 4 --num-workers 4 --lr 1e-4 --ssim-weight 0.2
+python val.py --data-dir D:\data\images\test --checkpoint checkpoints\latest.pt --results-dir results
 ```
 
 Simulate RK3588 encode and PC decode:
 
 ```powershell
-python encode_image.py test.jpg --checkpoint checkpoints\q2_latest.pt --quality-level 2 --output stream.cnz
-python decode_image.py stream.cnz --checkpoint checkpoints\q2_latest.pt --output recon.png
+python encode_image.py test.jpg --checkpoint checkpoints\latest.pt --output stream.cnz
+python decode_cnz.py stream.cnz --checkpoint checkpoints\latest.pt --output recon.png
 ```
 
-Check exported encoder ONNX after running `export_onnx.py`:
+## RK3588 Deployment Path
 
-```powershell
-python check_npu_compatibility.py --encoder onnx_models\encoder.onnx --checkpoint checkpoints\q2_latest.pt --quality-level 2
+The production deployment is split across RK3588 and PC:
+
+```text
+Python training:
+  image -> Encoder -> quantize/dequantize -> Decoder -> x_hat
+
+RK3588:
+  RKNN NPU -> Encoder only -> latent y
+  C++ CPU  -> quantize -> int16/int32 symbols -> zlib -> CNZ4 bitstream
+
+PC:
+  CNZ4 -> symbols -> dequantize -> PyTorch Decoder -> reconstructed image
+```
+
+Do not export the full `FactorizedPriorNano` to RKNN. Do not put Python
+`pickle`, Python dictionaries, or zlib calls inside RKNN. RKNN only runs the
+encoder.
+
+### Export Encoder ONNX
+
+```bash
+python tools/export_encoder_onnx.py \
+  --checkpoint checkpoints/latest.pt \
+  --output encoder.onnx \
+  --height 512 \
+  --width 512
+```
+
+Convert `encoder.onnx` to RKNN with RKNN-Toolkit2 on your RK3588 deployment
+workflow.
+
+### Export Entropy Parameters
+
+```bash
+python tools/export_entropy_params.py \
+  --checkpoint checkpoints/latest.pt \
+  --output entropy_params.json
+```
+
+The JSON contains `quant_step`, `medians`, channel count, config name, and
+downsampling factor. It is consumed by the C++ post-processing CLI.
+
+### Simulate RKNN Output
+
+```bash
+python tools/dump_latent.py \
+  --image test.png \
+  --checkpoint checkpoints/latest.pt \
+  --output latent.bin
+```
+
+`latent.bin` is float32 NCHW, batch=1, matching the C++ encoder input format.
+The tool also writes `latent.bin.json` metadata by default, so the C++ encoder
+can fill image and latent dimensions automatically. By default, the image is
+encoded at its original pixel size and padded to the model downsampling factor.
+Pass `--height` and `--width` only when you intentionally need a fixed-size
+RKNN input simulation.
+
+### Build C++ Post-Processor
+
+```bash
+cd cpp
+mkdir -p build
+cd build
+cmake ..
+make -j
+```
+
+Default C++ dependency is zlib. Optional LZ4/Zstd switches exist but are off by
+default:
+
+```bash
+cmake .. -DENABLE_LZ4=OFF -DENABLE_ZSTD=OFF
+```
+
+### C++ Encode
+
+```bash
+./cnz_encode_cli \
+  --latent latent.bin \
+  --params ../../entropy_params.json \
+  --output test.cnz \
+  --codec zlib \
+  --zlib-level 1
+```
+
+If `latent.bin.json` is present, image and latent dimensions are read from it.
+Without metadata, square latents are inferred from the raw file size and entropy
+parameter channel count. For non-square raw latents, pass `--latent-h` and
+`--latent-w`, or provide `--metadata path/to/latent.bin.json`.
+
+The C++ encoder uses PyTorch-compatible round-to-even quantization:
+
+```text
+symbols = round_to_even((y - median[c]) / quant_step)
+y_hat   = symbols * quant_step + median[c]
+```
+
+It stores int16 when all symbols fit `[-32768, 32767]`; otherwise it falls back
+to int32 and records the dtype in the CNZ4 header.
+
+### PC Decode
+
+```bash
+python decode_cnz.py test.cnz \
+  --checkpoint checkpoints/latest.pt \
+  --output recon.png
+```
+
+`decode_cnz.py` supports new CNZ4 files and falls back to old pickle v2/v3
+bitstreams when possible. C++ does not support old pickle files.
+
+### Consistency Tests
+
+```bash
+python tests/test_rounding_consistency.py
+python tests/test_python_cpp_payload_equivalence.py \
+  --image test.png \
+  --checkpoint checkpoints/latest.pt \
+  --params entropy_params.json \
+  --cnz-encode-cli cpp/build/cnz_encode_cli
+```
+
+The Python/C++ equivalence test compares C++ CNZ dequantized `y_hat` with the
+Python reference quantize/dequantize path and reports max/mean absolute error.
+
+### Benchmarks
+
+Python:
+
+```bash
+python tools/benchmark_pipeline.py \
+  --image test.png \
+  --checkpoint checkpoints/latest.pt \
+  --codec zlib \
+  --zlib-level 1
+```
+
+C++:
+
+```bash
+cpp/build/cnz_benchmark_cli \
+  --latent latent.bin \
+  --params entropy_params.json \
+  --latent-c 128 --latent-h 32 --latent-w 32 \
+  --orig-h 512 --orig-w 512 \
+  --padded-h 512 --padded-w 512 \
+  --output bench.cnz \
+  --codec zlib \
+  --zlib-level 1
+```
+
+## CNZ4 Bitstream
+
+All fields are little-endian:
+
+```text
+magic:          4 bytes  "CNZ4"
+version:        uint32
+header_size:    uint32
+orig_h:         uint32
+orig_w:         uint32
+padded_h:       uint32
+padded_w:       uint32
+latent_c:       uint32
+latent_h:       uint32
+latent_w:       uint32
+down_factor:    uint32
+dtype:          uint32   1=int16, 2=int32
+codec:          uint32   1=none, 2=zlib, 3=lz4, 4=zstd
+quant_step:     float32
+num_medians:    uint32
+payload_size:   uint64
+medians:        float32[num_medians]
+payload:        bytes
 ```

@@ -1,0 +1,16 @@
+{
+  "format": "compressai-nano-latent-metadata-v1",
+  "image": "samples/54.png",
+  "dtype": "float32",
+  "layout": "NCHW",
+  "source_h": 4500,
+  "source_w": 6000,
+  "orig_h": 4500,
+  "orig_w": 6000,
+  "padded_h": 4512,
+  "padded_w": 6000,
+  "latent_c": 128,
+  "latent_h": 282,
+  "latent_w": 375,
+  "downsampling_factor": 16
+}

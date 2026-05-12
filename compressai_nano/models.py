@@ -11,8 +11,7 @@ from .layers import ConvNormAct, conv, deconv, init_module, make_activation
 
 
 @dataclass(frozen=True)
-class QualityConfig:
-    quality_level: int
+class ModelConfig:
     N: int
     M: int
     quant_step: float
@@ -22,46 +21,19 @@ class QualityConfig:
     name: str
 
 
-QUALITY_CONFIGS: dict[int, QualityConfig] = {
-    1: QualityConfig(
-        quality_level=1,
-        N=128,
-        M=128,
-        quant_step=1.50,
-        decoder_channels=192,
-        decoder_res_blocks=2,
-        refinement_blocks=3,
-        name="low-rate",
-    ),
-    2: QualityConfig(
-        quality_level=2,
-        N=128,
-        M=128,
-        quant_step=1.00,
-        decoder_channels=224,
-        decoder_res_blocks=2,
-        refinement_blocks=4,
-        name="balanced",
-    ),
-    3: QualityConfig(
-        quality_level=3,
-        N=128,
-        M=128,
-        quant_step=0.67,
-        decoder_channels=256,
-        decoder_res_blocks=3,
-        refinement_blocks=5,
-        name="high-quality",
-    ),
-}
+MODEL_CONFIG = ModelConfig(
+    N=128,
+    M=128,
+    quant_step=0.67,
+    decoder_channels=256,
+    decoder_res_blocks=3,
+    refinement_blocks=5,
+    name="high-quality",
+)
 
 
-def get_quality_config(quality_level: int) -> QualityConfig:
-    try:
-        return QUALITY_CONFIGS[int(quality_level)]
-    except KeyError as exc:
-        valid = ", ".join(str(level) for level in QUALITY_CONFIGS)
-        raise ValueError(f"quality_level must be one of: {valid}") from exc
+def get_model_config() -> ModelConfig:
+    return MODEL_CONFIG
 
 
 class Encoder(nn.Module):
@@ -129,9 +101,9 @@ class Decoder(nn.Module):
         self,
         N: int = 128,
         M: int = 128,
-        decoder_channels: int = 224,
-        decoder_res_blocks: int = 2,
-        refinement_blocks: int = 4,
+        decoder_channels: int = 256,
+        decoder_res_blocks: int = 3,
+        refinement_blocks: int = 5,
         activation: str = "leaky_relu",
         clamp_output: bool = True,
     ) -> None:
@@ -184,16 +156,14 @@ class FactorizedPriorNano(nn.Module):
 
     def __init__(
         self,
-        quality_level: int = 2,
         activation: str = "relu",
         decoder_activation: str = "leaky_relu",
         clamp_decoder_output: bool = True,
     ) -> None:
         super().__init__()
-        config = get_quality_config(quality_level)
+        config = get_model_config()
 
-        self.quality_level = config.quality_level
-        self.quality_name = config.name
+        self.model_name = config.name
         self.N = config.N
         self.M = config.M
         self.decoder_channels = config.decoder_channels
@@ -244,8 +214,9 @@ class FactorizedPriorNano(nn.Module):
             "strings": payload.strings,
             "shape": payload.shape,
             "latent_shape": payload.latent_shape,
-            "quality_level": self.quality_level,
             "quant_step": payload.quant_step,
+            "dtype": payload.dtype,
+            "codec": payload.codec,
         }
 
     @torch.no_grad()
@@ -260,5 +231,5 @@ class FactorizedPriorNano(nn.Module):
         return {"x_hat": x_hat, "y_hat": y_hat}
 
 
-def get_model(quality_level: int = 2, **kwargs: object) -> FactorizedPriorNano:
-    return FactorizedPriorNano(quality_level=quality_level, **kwargs)
+def get_model(**kwargs: object) -> FactorizedPriorNano:
+    return FactorizedPriorNano(**kwargs)

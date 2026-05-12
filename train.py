@@ -17,11 +17,7 @@ from compressai_nano import FactorizedPriorNano
 
 
 IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
-LAMBDA_BY_QUALITY = {
-    1: 0.0018,
-    2: 0.0035,
-    3: 0.0067,
-}
+DEFAULT_LAMBDA = 0.0067
 
 
 class ImageFolderDataset(Dataset):
@@ -212,14 +208,13 @@ def save_checkpoint(
 ) -> None:
     payload = {
         "epoch": epoch,
-        "quality_level": args.quality_level,
-            "lambda": args.lmbda,
-            "ssim_weight": args.ssim_weight,
-            "encoder_activation": args.encoder_activation,
-            "decoder_activation": args.decoder_activation,
-            "state_dict": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "metrics": metrics,
+        "lambda": args.lmbda,
+        "ssim_weight": args.ssim_weight,
+        "encoder_activation": args.encoder_activation,
+        "decoder_activation": args.decoder_activation,
+        "state_dict": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "metrics": metrics,
     }
     if scheduler is not None:
         payload["scheduler"] = scheduler.state_dict()
@@ -316,7 +311,6 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train compressai-nano.")
     parser.add_argument("--train-dir", type=Path, required=True)
     parser.add_argument("--val-dir", type=Path, default=None)
-    parser.add_argument("--quality-level", type=int, default=2, choices=(1, 2, 3))
     parser.add_argument("--lambda", dest="lmbda", type=float, default=None)
     parser.add_argument("--ssim-weight", type=float, default=0.2)
     parser.add_argument("--epochs", type=int, default=100)
@@ -348,7 +342,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     if args.lmbda is None:
-        args.lmbda = LAMBDA_BY_QUALITY[args.quality_level]
+        args.lmbda = DEFAULT_LAMBDA
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -388,7 +382,6 @@ def main() -> None:
         )
 
     model = FactorizedPriorNano(
-        quality_level=args.quality_level,
         activation=args.encoder_activation,
         decoder_activation=args.decoder_activation,
     ).to(device)
@@ -403,8 +396,8 @@ def main() -> None:
         print(f"resumed: {args.resume} at epoch {start_epoch}")
 
     print(
-        f"train images={len(train_dataset)}, quality={args.quality_level}, "
-        f"lambda={args.lmbda}, ssim_weight={args.ssim_weight}, "
+        f"train images={len(train_dataset)}, lambda={args.lmbda}, "
+        f"ssim_weight={args.ssim_weight}, "
         f"batch={args.batch_size}, lr={get_current_lr(optimizer):.2e}"
     )
 
@@ -437,8 +430,8 @@ def main() -> None:
             lr_text = f" | lr reduced: {old_lr:.2e} -> {new_lr:.2e}"
         print(f"epoch {epoch:03d}: {metric_text} | monitor={monitor_name}{lr_text}")
 
-        epoch_path = args.checkpoint_dir / f"q{args.quality_level}_epoch{epoch:03d}.pt"
-        latest_path = args.checkpoint_dir / f"q{args.quality_level}_latest.pt"
+        epoch_path = args.checkpoint_dir / f"epoch{epoch:03d}.pt"
+        latest_path = args.checkpoint_dir / "latest.pt"
         save_checkpoint(epoch_path, model, optimizer, scheduler, epoch, args, metrics)
         save_checkpoint(latest_path, model, optimizer, scheduler, epoch, args, metrics)
 
