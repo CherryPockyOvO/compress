@@ -38,7 +38,7 @@ TRAIN_PROFILES = {
     "detail": {
         "lmbda": 0.0200,
         "rate_weight": 1.0,
-        "target_bpp": 0.75,
+        "target_bpp": 1,
         "ssim_weight": 0.40,
         "detail_weight": 6.0,
         "l1_weight": 0.50,
