@@ -135,6 +135,36 @@ python train.py --train-dir data\train --val-dir data\val --epochs 150 --batch-s
 python val.py --data-dir D:\data\images\test --checkpoint checkpoints\latest.pt --results-dir results
 ```
 
+### High-Precision Detail Fine-Tuning
+
+Use this when you already have a trained `.pt` at the current quality level and
+want a second, higher-bpp level with better hair, edge, and texture retention.
+The preset keeps the same model tensor shapes, so old compatible checkpoints can
+be used as the starting point. It raises the distortion target, adds Sobel
+gradient detail loss, adds a small L1 term, and lowers the latent quantization
+step.
+
+```bash
+python train.py \
+  --quality-profile detail \
+  --init-checkpoint checkpoints/latest.pt \
+  --train-dir data/train \
+  --val-dir data/val \
+  --checkpoint-dir checkpoints_detail
+```
+
+The `detail` preset expands to `lambda=0.013`, `ssim_weight=0.35`,
+`detail_weight=0.12`, `l1_weight=0.03`, `quant_step=0.50`, `crop_size=384`,
+`batch_size=2`, `lr=3e-5`, and `epochs=80`. Override any of these on the command
+line if your GPU memory or target bitrate needs a different tradeoff.
+
+Export and deploy the high-precision level from the new checkpoint directory:
+
+```bash
+python tools/export_encoder_onnx.py --checkpoint checkpoints_detail/latest.pt --output encoder_detail.onnx --height 512 --width 512
+python tools/export_entropy_params.py --checkpoint checkpoints_detail/latest.pt --output entropy_params_detail.json
+```
+
 Simulate RK3588 encode and PC decode:
 
 ```powershell

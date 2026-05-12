@@ -19,6 +19,31 @@ from compressai_nano import FactorizedPriorNano
 IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 DEFAULT_LAMBDA = 0.0067
 
+TRAIN_PROFILES = {
+    "balanced": {
+        "lmbda": DEFAULT_LAMBDA,
+        "ssim_weight": 0.2,
+        "detail_weight": 0.0,
+        "l1_weight": 0.0,
+        "quant_step": None,
+        "epochs": 100,
+        "batch_size": 4,
+        "crop_size": 256,
+        "lr": 1e-4,
+    },
+    "detail": {
+        "lmbda": 0.0130,
+        "ssim_weight": 0.35,
+        "detail_weight": 0.12,
+        "l1_weight": 0.03,
+        "quant_step": 0.50,
+        "epochs": 80,
+        "batch_size": 2,
+        "crop_size": 384,
+        "lr": 3e-5,
+    },
+}
+
 
 class ImageFolderDataset(Dataset):
     def __init__(self, root: Path, transform: Callable[[Image.Image], torch.Tensor]) -> None:
@@ -158,26 +183,70 @@ def ssim_index(x: torch.Tensor, y: torch.Tensor, window_size: int = 11) -> torch
     return score.mean()
 
 
+def gradient_detail_loss(x_hat: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    channels = x_hat.size(1)
+    kernel_x = x_hat.new_tensor(
+        [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]
+    ).view(1, 1, 3, 3)
+    kernel_y = x_hat.new_tensor(
+        [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]
+    ).view(1, 1, 3, 3)
+    kernel_x = kernel_x.expand(channels, 1, 3, 3) / 8.0
+    kernel_y = kernel_y.expand(channels, 1, 3, 3) / 8.0
+
+    pred_gx = F.conv2d(x_hat, kernel_x, padding=1, groups=channels)
+    pred_gy = F.conv2d(x_hat, kernel_y, padding=1, groups=channels)
+    target_gx = F.conv2d(target, kernel_x, padding=1, groups=channels)
+    target_gy = F.conv2d(target, kernel_y, padding=1, groups=channels)
+    eps = 1e-3
+    return (
+        torch.sqrt((pred_gx - target_gx).pow(2) + eps * eps).mean()
+        + torch.sqrt((pred_gy - target_gy).pow(2) + eps * eps).mean()
+    )
+
+
 class RateDistortionLoss(nn.Module):
-    def __init__(self, lmbda: float, ssim_weight: float = 0.2) -> None:
+    def __init__(
+        self,
+        lmbda: float,
+        ssim_weight: float = 0.2,
+        detail_weight: float = 0.0,
+        l1_weight: float = 0.0,
+    ) -> None:
         super().__init__()
         self.lmbda = float(lmbda)
         self.ssim_weight = float(ssim_weight)
+        self.detail_weight = float(detail_weight)
+        self.l1_weight = float(l1_weight)
 
     def forward(self, output: dict[str, Any], target: torch.Tensor) -> dict[str, torch.Tensor]:
-        mse = F.mse_loss(output["x_hat"], target)
+        x_hat = output["x_hat"]
+        mse = F.mse_loss(x_hat, target)
         num_pixels = target.size(0) * target.size(2) * target.size(3)
         bpp = compute_bpp(output["likelihoods"], num_pixels)
         distortion = self.lmbda * (255.0**2) * mse
-        ssim = ssim_index(output["x_hat"], target)
+        ssim = ssim_index(x_hat, target)
         ssim_loss = 1.0 - ssim
-        loss = distortion + bpp + self.ssim_weight * ssim_loss
+        l1_loss = F.l1_loss(x_hat, target)
+        if self.detail_weight > 0:
+            detail_loss = gradient_detail_loss(x_hat, target)
+        else:
+            detail_loss = mse.new_zeros(())
+        loss = (
+            distortion
+            + bpp
+            + self.ssim_weight * ssim_loss
+            + self.detail_weight * detail_loss
+            + self.l1_weight * l1_loss
+        )
         return {
             "loss": loss,
             "mse": mse,
             "bpp": bpp,
             "ssim": ssim,
             "ssim_loss": ssim_loss,
+            "detail_loss": detail_loss,
+            "l1_loss": l1_loss,
         }
 
 
@@ -197,6 +266,15 @@ def load_checkpoint(
     return int(raw.get("epoch", 0)) if isinstance(raw, dict) else 0
 
 
+@torch.no_grad()
+def set_quant_step(model: FactorizedPriorNano, quant_step: float | None) -> None:
+    if quant_step is None:
+        return
+    if quant_step <= 0:
+        raise ValueError(f"quant_step must be positive, got {quant_step}")
+    model.entropy_bottleneck.quant_step.fill_(float(quant_step))
+
+
 def save_checkpoint(
     path: Path,
     model: nn.Module,
@@ -208,8 +286,12 @@ def save_checkpoint(
 ) -> None:
     payload = {
         "epoch": epoch,
+        "quality_profile": args.quality_profile,
         "lambda": args.lmbda,
         "ssim_weight": args.ssim_weight,
+        "detail_weight": args.detail_weight,
+        "l1_weight": args.l1_weight,
+        "quant_step": float(model.entropy_bottleneck.quant_step.detach().cpu()),
         "encoder_activation": args.encoder_activation,
         "decoder_activation": args.decoder_activation,
         "state_dict": model.state_dict(),
@@ -261,7 +343,14 @@ def train_one_epoch(
     amp_enabled: bool,
 ) -> dict[str, float]:
     model.train()
-    totals = {"loss": 0.0, "mse": 0.0, "bpp": 0.0, "ssim": 0.0}
+    totals = {
+        "loss": 0.0,
+        "mse": 0.0,
+        "bpp": 0.0,
+        "ssim": 0.0,
+        "detail_loss": 0.0,
+        "l1_loss": 0.0,
+    }
 
     for batch in loader:
         batch = batch.to(device, non_blocking=True)
@@ -293,7 +382,14 @@ def evaluate_loss(
     device: torch.device,
 ) -> dict[str, float]:
     model.eval()
-    totals = {"loss": 0.0, "mse": 0.0, "bpp": 0.0, "ssim": 0.0}
+    totals = {
+        "loss": 0.0,
+        "mse": 0.0,
+        "bpp": 0.0,
+        "ssim": 0.0,
+        "detail_loss": 0.0,
+        "l1_loss": 0.0,
+    }
 
     for batch in loader:
         batch = batch.to(device, non_blocking=True)
@@ -309,15 +405,39 @@ def evaluate_loss(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train compressai-nano.")
+    parser.add_argument(
+        "--quality-profile",
+        choices=tuple(TRAIN_PROFILES.keys()),
+        default="balanced",
+        help="Training preset. detail is the high-precision fine-tuning preset for hair, lines, and texture.",
+    )
     parser.add_argument("--train-dir", type=Path, required=True)
     parser.add_argument("--val-dir", type=Path, default=None)
     parser.add_argument("--lambda", dest="lmbda", type=float, default=None)
-    parser.add_argument("--ssim-weight", type=float, default=0.2)
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--ssim-weight", type=float, default=None)
+    parser.add_argument(
+        "--detail-weight",
+        type=float,
+        default=None,
+        help="Weight for Sobel gradient detail loss. Use >0 to preserve lines and fine texture.",
+    )
+    parser.add_argument(
+        "--l1-weight",
+        type=float,
+        default=None,
+        help="Optional L1 reconstruction weight. Small values usually sharpen fine local contrast.",
+    )
+    parser.add_argument(
+        "--quant-step",
+        type=float,
+        default=None,
+        help="Override latent quantization step after model initialization/checkpoint load.",
+    )
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--crop-size", type=int, default=256)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--crop-size", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
     parser.add_argument(
         "--lr-scheduler",
         choices=("reduce-on-plateau", "none"),
@@ -331,6 +451,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-lr", type=float, default=1e-6)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("checkpoints"))
+    parser.add_argument(
+        "--init-checkpoint",
+        type=Path,
+        default=None,
+        help="Load model weights only and start a new fine-tuning run from epoch 1.",
+    )
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--encoder-activation", choices=("relu", "leaky_relu"), default="relu")
@@ -339,10 +465,25 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def apply_quality_profile(args: argparse.Namespace) -> None:
+    profile = TRAIN_PROFILES[args.quality_profile]
+    for key, value in profile.items():
+        if getattr(args, key) is None:
+            setattr(args, key, value)
+
+    if args.init_checkpoint is not None and args.resume is not None:
+        raise ValueError("--init-checkpoint and --resume are mutually exclusive")
+    if args.detail_weight < 0:
+        raise ValueError("--detail-weight must be non-negative")
+    if args.l1_weight < 0:
+        raise ValueError("--l1-weight must be non-negative")
+    if args.quant_step is not None and args.quant_step <= 0:
+        raise ValueError("--quant-step must be positive")
+
+
 def main() -> None:
     args = parse_args()
-    if args.lmbda is None:
-        args.lmbda = DEFAULT_LAMBDA
+    apply_quality_profile(args)
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -385,19 +526,33 @@ def main() -> None:
         activation=args.encoder_activation,
         decoder_activation=args.decoder_activation,
     ).to(device)
-    criterion = RateDistortionLoss(args.lmbda, ssim_weight=args.ssim_weight)
+    set_quant_step(model, args.quant_step)
+    criterion = RateDistortionLoss(
+        args.lmbda,
+        ssim_weight=args.ssim_weight,
+        detail_weight=args.detail_weight,
+        l1_weight=args.l1_weight,
+    )
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = make_scheduler(optimizer, args)
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
     start_epoch = 0
-    if args.resume is not None:
+    if args.init_checkpoint is not None:
+        source_epoch = load_checkpoint(args.init_checkpoint, model)
+        set_quant_step(model, args.quant_step)
+        print(f"initialized weights: {args.init_checkpoint} (source epoch {source_epoch})")
+    elif args.resume is not None:
         start_epoch = load_checkpoint(args.resume, model, optimizer, scheduler)
+        set_quant_step(model, args.quant_step)
         print(f"resumed: {args.resume} at epoch {start_epoch}")
 
+    quant_step = float(model.entropy_bottleneck.quant_step.detach().cpu())
     print(
-        f"train images={len(train_dataset)}, lambda={args.lmbda}, "
-        f"ssim_weight={args.ssim_weight}, "
+        f"profile={args.quality_profile}, train images={len(train_dataset)}, "
+        f"lambda={args.lmbda}, ssim_weight={args.ssim_weight}, "
+        f"detail_weight={args.detail_weight}, l1_weight={args.l1_weight}, "
+        f"quant_step={quant_step}, crop={args.crop_size}, "
         f"batch={args.batch_size}, lr={get_current_lr(optimizer):.2e}"
     )
 
