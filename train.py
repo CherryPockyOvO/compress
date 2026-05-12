@@ -21,6 +21,7 @@ from compressai_nano import FactorizedPriorNano
 
 IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 DEFAULT_LAMBDA = 0.0067
+OFFICIAL_MSE_LAMBDA_Q7 = 0.0932
 
 TRAIN_PROFILES = {
     "balanced": {
@@ -39,7 +40,7 @@ TRAIN_PROFILES = {
         "lr": 1e-4,
     },
     "detail": {
-        "lmbda": 0.0200,
+        "lmbda": OFFICIAL_MSE_LAMBDA_Q7,
         "rate_weight": 1.0,
         "target_bpp": 1.0,
         "ssim_weight": 0.40,

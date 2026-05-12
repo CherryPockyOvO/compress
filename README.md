@@ -156,7 +156,7 @@ python train.py \
   --max-steps 3000
 ```
 
-The `detail` preset expands to `lambda=0.020`, `target_bpp=1.0`,
+The `detail` preset expands to `lambda=0.0932`, `target_bpp=1.0`,
 `rate_weight=1.0`, `ssim_weight=0.40`, `detail_weight=6.0`, `l1_weight=0.50`,
 `lpips_weight=0.03`, `quant_step=0.45`, `crop_size=384`, `batch_size=64`,
 `lr=3e-5`, and `epochs=80`. The balanced preset uses `batch_size=128` with `crop_size=256`.
