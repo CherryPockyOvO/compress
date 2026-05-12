@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image, ImageOps
+Image.MAX_IMAGE_PIXELS = None
 from torch.utils.data import DataLoader, Dataset
 
 from compressai_nano import FactorizedPriorNano
