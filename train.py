@@ -780,10 +780,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--eval-interval-steps",
         type=int,
-        default=None,
+        default=100,
         help=(
-            "Run validation every N optimizer updates. Defaults to the checkpoint "
-            "interval when --val-dir is set. Use 0 to disable step validation."
+            "Run validation every N optimizer updates. Default matches the "
+            "100-step checkpoint cadence. Use 0 to disable step validation."
         ),
     )
     parser.add_argument("--batch-size", type=int, default=None)
@@ -838,8 +838,6 @@ def apply_quality_profile(args: argparse.Namespace) -> None:
         raise ValueError("--max-steps must be positive")
     if args.checkpoint_interval_steps <= 0:
         raise ValueError("--checkpoint-interval-steps must be positive")
-    if args.eval_interval_steps is None:
-        args.eval_interval_steps = args.checkpoint_interval_steps if args.val_dir is not None else 0
     if args.eval_interval_steps < 0:
         raise ValueError("--eval-interval-steps must be non-negative")
     if args.rate_weight < 0:
@@ -951,13 +949,14 @@ def main() -> None:
         end_epoch = max(end_epoch, needed_epochs)
 
     last_checkpoint_step = global_step
+    best_val_loss = math.inf
 
     def save_step_checkpoint(
         epoch: int,
         step: int,
         train_metrics: dict[str, float],
     ) -> bool:
-        nonlocal last_checkpoint_step
+        nonlocal best_val_loss, last_checkpoint_step
 
         metrics = dict(train_metrics)
         is_final_step = args.max_steps is not None and step >= args.max_steps
@@ -988,32 +987,39 @@ def main() -> None:
         checkpoint_name = f"e{checkpoint_index}.pt"
         checkpoint_path = args.checkpoint_dir / checkpoint_name
         latest_path = args.checkpoint_dir / "latest.pt"
+        best_path = args.checkpoint_dir / "best.pt"
+        improved = "val_loss" in metrics and metrics["val_loss"] < best_val_loss
 
         if args.log_style == "full":
             metric_text = ", ".join(f"{key}={value:.6f}" for key, value in metrics.items())
             lr_text = ""
             if new_lr < old_lr:
                 lr_text = f" | lr reduced: {old_lr:.2e} -> {new_lr:.2e}"
+            best_text = " | best" if improved else ""
             tqdm.write(
                 f"{checkpoint_name} epoch {epoch:03d} step {step}: "
-                f"{metric_text} | monitor={monitor_name}{lr_text}"
+                f"{metric_text} | monitor={monitor_name}{lr_text}{best_text}"
             )
         else:
-            tqdm.write(
-                format_checkpoint_summary(
-                    checkpoint_name,
-                    epoch,
-                    step,
-                    metrics,
-                    monitor_name,
-                    old_lr,
-                    new_lr,
-                    include_lpips=(args.lpips_weight > 0),
-                )
+            summary = format_checkpoint_summary(
+                checkpoint_name,
+                epoch,
+                step,
+                metrics,
+                monitor_name,
+                old_lr,
+                new_lr,
+                include_lpips=(args.lpips_weight > 0),
             )
+            if improved:
+                summary += "\n  best: updated best.pt"
+            tqdm.write(summary)
 
         save_checkpoint(checkpoint_path, model, optimizer, scheduler, epoch, step, args, metrics)
         save_checkpoint(latest_path, model, optimizer, scheduler, epoch, step, args, metrics)
+        if improved:
+            best_val_loss = metrics["val_loss"]
+            save_checkpoint(best_path, model, optimizer, scheduler, epoch, step, args, metrics)
         last_checkpoint_step = step
         return True
 
