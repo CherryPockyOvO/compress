@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from PIL import Image, ImageOps
 Image.MAX_IMAGE_PIXELS = None
 from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
 
 from compressai_nano import FactorizedPriorNano
 
@@ -40,7 +41,7 @@ TRAIN_PROFILES = {
     "detail": {
         "lmbda": 0.0200,
         "rate_weight": 1.0,
-        "target_bpp": 1,
+        "target_bpp": 1.0,
         "ssim_weight": 0.40,
         "detail_weight": 6.0,
         "l1_weight": 0.50,
@@ -439,7 +440,8 @@ def format_detail_metrics(
     return " ".join(parts)
 
 
-def format_epoch_summary(
+def format_checkpoint_summary(
+    checkpoint_name: str,
     epoch: int,
     global_step: int,
     metrics: dict[str, float],
@@ -449,7 +451,7 @@ def format_epoch_summary(
     include_lpips: bool,
 ) -> str:
     primary_parts = [
-        f"epoch {epoch:03d} step {global_step}",
+        f"{checkpoint_name} epoch {epoch:03d} step {global_step}",
         f"train {format_primary_metrics(metrics)}",
     ]
     if "val_loss" in metrics:
@@ -507,6 +509,10 @@ def print_run_config(
         f"steps/epoch={len(train_loader)} start_step={global_step} "
         f"lr={get_current_lr(optimizer):.2e} amp={amp_enabled}"
     )
+    print(
+        f"  checkpoints: every {args.checkpoint_interval_steps} steps -> eN.pt/latest.pt "
+        f"eval_interval={args.eval_interval_steps} progress={args.progress}"
+    )
 
 
 def make_autocast(enabled: bool):
@@ -537,8 +543,12 @@ def train_one_epoch(
     device: torch.device,
     grad_clip: float,
     amp_enabled: bool,
+    epoch: int,
     global_step: int,
     max_steps: int | None,
+    checkpoint_interval_steps: int,
+    progress_enabled: bool,
+    on_checkpoint: Callable[[int, int, dict[str, float]], bool] | None,
 ) -> tuple[dict[str, float], int, bool]:
     model.train()
     totals = {
@@ -551,11 +561,28 @@ def train_one_epoch(
         "l1_loss": 0.0,
         "lpips_loss": 0.0,
     }
+    interval_totals = {key: 0.0 for key in totals}
     processed_samples = 0
+    interval_samples = 0
     skipped_batches = 0
+    interval_skipped_batches = 0
     stop_training = False
 
-    for batch in loader:
+    remaining_steps = None if max_steps is None else max(0, max_steps - global_step)
+    total_batches = len(loader)
+    if remaining_steps is not None:
+        total_batches = min(total_batches, remaining_steps)
+    progress = tqdm(
+        loader,
+        total=total_batches,
+        desc=f"train e{epoch:03d}",
+        unit="step",
+        dynamic_ncols=True,
+        leave=False,
+        disable=not progress_enabled,
+    )
+
+    for batch in progress:
         batch = batch.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
 
@@ -565,7 +592,9 @@ def train_one_epoch(
 
         if not tensor_is_finite(losses["loss"]):
             skipped_batches += 1
+            interval_skipped_batches += 1
             optimizer.zero_grad(set_to_none=True)
+            progress.set_postfix(step=global_step, skipped=skipped_batches)
             continue
 
         scaler.scale(losses["loss"]).backward()
@@ -573,8 +602,10 @@ def train_one_epoch(
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         if not tensor_is_finite(grad_norm):
             skipped_batches += 1
+            interval_skipped_batches += 1
             optimizer.zero_grad(set_to_none=True)
             scaler.update()
+            progress.set_postfix(step=global_step, skipped=skipped_batches)
             continue
 
         scaler.step(optimizer)
@@ -582,11 +613,40 @@ def train_one_epoch(
 
         batch_size = batch.size(0)
         processed_samples += batch_size
+        interval_samples += batch_size
         global_step += 1
         for key in totals:
-            totals[key] += float(losses[key].detach()) * batch_size
+            value = float(losses[key].detach()) * batch_size
+            totals[key] += value
+            interval_totals[key] += value
 
-        if max_steps is not None and global_step >= max_steps:
+        progress.set_postfix(
+            step=global_step,
+            loss=f"{float(losses['loss'].detach()):.4f}",
+            bpp=f"{float(losses['bpp'].detach()):.3f}",
+        )
+
+        reached_max_steps = max_steps is not None and global_step >= max_steps
+        should_checkpoint = (
+            checkpoint_interval_steps > 0
+            and interval_samples > 0
+            and (global_step % checkpoint_interval_steps == 0 or reached_max_steps)
+        )
+        if should_checkpoint and on_checkpoint is not None:
+            interval_count = max(1, interval_samples)
+            interval_metrics = {
+                key: value / interval_count for key, value in interval_totals.items()
+            }
+            interval_metrics["skipped_batches"] = float(interval_skipped_batches)
+            if not on_checkpoint(epoch, global_step, interval_metrics):
+                stop_training = True
+                break
+            model.train()
+            interval_totals = {key: 0.0 for key in totals}
+            interval_samples = 0
+            interval_skipped_batches = 0
+
+        if reached_max_steps:
             stop_training = True
             break
 
@@ -602,6 +662,7 @@ def evaluate_loss(
     criterion: RateDistortionLoss,
     loader: DataLoader,
     device: torch.device,
+    progress_enabled: bool = True,
 ) -> dict[str, float]:
     model.eval()
     totals = {
@@ -617,17 +678,30 @@ def evaluate_loss(
     processed_samples = 0
     skipped_batches = 0
 
-    for batch in loader:
+    progress = tqdm(
+        loader,
+        desc="val",
+        unit="batch",
+        dynamic_ncols=True,
+        leave=False,
+        disable=not progress_enabled,
+    )
+    for batch in progress:
         batch = batch.to(device, non_blocking=True)
         output = model(batch)
         losses = criterion(output, batch)
         if not tensor_is_finite(losses["loss"]):
             skipped_batches += 1
+            progress.set_postfix(skipped=skipped_batches)
             continue
         batch_size = batch.size(0)
         processed_samples += batch_size
         for key in totals:
             totals[key] += float(losses[key].detach()) * batch_size
+        progress.set_postfix(
+            loss=f"{float(losses['loss'].detach()):.4f}",
+            bpp=f"{float(losses['bpp'].detach()):.3f}",
+        )
 
     count = max(1, processed_samples)
     metrics = {f"val_{key}": value / count for key, value in totals.items()}
@@ -696,6 +770,21 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Stop after this many optimizer updates. This is useful for large datasets where epochs are too coarse.",
     )
+    parser.add_argument(
+        "--checkpoint-interval-steps",
+        type=int,
+        default=100,
+        help="Save step checkpoints every N optimizer updates. Default saves e1.pt at step 100.",
+    )
+    parser.add_argument(
+        "--eval-interval-steps",
+        type=int,
+        default=None,
+        help=(
+            "Run validation every N optimizer updates. Defaults to the checkpoint "
+            "interval when --val-dir is set. Use 0 to disable step validation."
+        ),
+    )
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--crop-size", type=int, default=None)
@@ -730,6 +819,7 @@ def parse_args() -> argparse.Namespace:
         default="compact",
         help="compact prints grouped epoch summaries; full prints every metric key.",
     )
+    parser.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
 
 
@@ -745,6 +835,12 @@ def apply_quality_profile(args: argparse.Namespace) -> None:
         raise ValueError("--epochs must be positive")
     if args.max_steps is not None and args.max_steps <= 0:
         raise ValueError("--max-steps must be positive")
+    if args.checkpoint_interval_steps <= 0:
+        raise ValueError("--checkpoint-interval-steps must be positive")
+    if args.eval_interval_steps is None:
+        args.eval_interval_steps = args.checkpoint_interval_steps if args.val_dir is not None else 0
+    if args.eval_interval_steps < 0:
+        raise ValueError("--eval-interval-steps must be non-negative")
     if args.rate_weight < 0:
         raise ValueError("--rate-weight must be non-negative")
     if args.target_bpp is not None and args.target_bpp < 0:
@@ -853,6 +949,73 @@ def main() -> None:
         needed_epochs = start_epoch + math.ceil(remaining_steps / len(train_loader))
         end_epoch = max(end_epoch, needed_epochs)
 
+    last_checkpoint_step = global_step
+
+    def save_step_checkpoint(
+        epoch: int,
+        step: int,
+        train_metrics: dict[str, float],
+    ) -> bool:
+        nonlocal last_checkpoint_step
+
+        metrics = dict(train_metrics)
+        is_final_step = args.max_steps is not None and step >= args.max_steps
+        should_eval = (
+            val_loader is not None
+            and args.eval_interval_steps > 0
+            and (step % args.eval_interval_steps == 0 or is_final_step)
+        )
+        if should_eval:
+            metrics.update(evaluate_loss(model, criterion, val_loader, device, args.progress))
+
+        if not metrics_are_finite(metrics) or not model_parameters_are_finite(model):
+            tqdm.write(
+                f"non-finite training state at epoch {epoch:03d}, step {step}; "
+                "checkpoint was not saved. Resume from the previous good checkpoint."
+            )
+            return False
+
+        monitor_name = "val_loss" if "val_loss" in metrics else "loss"
+        monitor_value = metrics[monitor_name]
+        old_lr = get_current_lr(optimizer)
+        if scheduler is not None and (val_loader is None or should_eval):
+            scheduler.step(monitor_value)
+        new_lr = get_current_lr(optimizer)
+        metrics["lr"] = new_lr
+
+        checkpoint_index = max(1, math.ceil(step / args.checkpoint_interval_steps))
+        checkpoint_name = f"e{checkpoint_index}.pt"
+        checkpoint_path = args.checkpoint_dir / checkpoint_name
+        latest_path = args.checkpoint_dir / "latest.pt"
+
+        if args.log_style == "full":
+            metric_text = ", ".join(f"{key}={value:.6f}" for key, value in metrics.items())
+            lr_text = ""
+            if new_lr < old_lr:
+                lr_text = f" | lr reduced: {old_lr:.2e} -> {new_lr:.2e}"
+            tqdm.write(
+                f"{checkpoint_name} epoch {epoch:03d} step {step}: "
+                f"{metric_text} | monitor={monitor_name}{lr_text}"
+            )
+        else:
+            tqdm.write(
+                format_checkpoint_summary(
+                    checkpoint_name,
+                    epoch,
+                    step,
+                    metrics,
+                    monitor_name,
+                    old_lr,
+                    new_lr,
+                    include_lpips=(args.lpips_weight > 0),
+                )
+            )
+
+        save_checkpoint(checkpoint_path, model, optimizer, scheduler, epoch, step, args, metrics)
+        save_checkpoint(latest_path, model, optimizer, scheduler, epoch, step, args, metrics)
+        last_checkpoint_step = step
+        return True
+
     for epoch in range(start_epoch + 1, end_epoch + 1):
         train_metrics, global_step, stop_training = train_one_epoch(
             model,
@@ -863,51 +1026,18 @@ def main() -> None:
             device,
             args.grad_clip,
             amp_enabled,
+            epoch,
             global_step,
             args.max_steps,
+            args.checkpoint_interval_steps,
+            args.progress,
+            save_step_checkpoint,
         )
-        metrics = dict(train_metrics)
-        if val_loader is not None:
-            metrics.update(evaluate_loss(model, criterion, val_loader, device))
 
-        if not metrics_are_finite(metrics) or not model_parameters_are_finite(model):
-            print(
-                f"non-finite training state at epoch {epoch:03d}, step {global_step}; "
-                "checkpoint was not saved. Resume from the previous good epoch."
-            )
-            break
+        if epoch == end_epoch and global_step != last_checkpoint_step:
+            if not save_step_checkpoint(epoch, global_step, train_metrics):
+                break
 
-        monitor_name = "val_loss" if val_loader is not None else "loss"
-        monitor_value = metrics[monitor_name]
-        old_lr = get_current_lr(optimizer)
-        if scheduler is not None:
-            scheduler.step(monitor_value)
-        new_lr = get_current_lr(optimizer)
-        metrics["lr"] = new_lr
-
-        if args.log_style == "full":
-            metric_text = ", ".join(f"{key}={value:.6f}" for key, value in metrics.items())
-            lr_text = ""
-            if new_lr < old_lr:
-                lr_text = f" | lr reduced: {old_lr:.2e} -> {new_lr:.2e}"
-            print(f"epoch {epoch:03d} step {global_step}: {metric_text} | monitor={monitor_name}{lr_text}")
-        else:
-            print(
-                format_epoch_summary(
-                    epoch,
-                    global_step,
-                    metrics,
-                    monitor_name,
-                    old_lr,
-                    new_lr,
-                    include_lpips=(args.lpips_weight > 0),
-                )
-            )
-
-        epoch_path = args.checkpoint_dir / f"epoch{epoch:03d}.pt"
-        latest_path = args.checkpoint_dir / "latest.pt"
-        save_checkpoint(epoch_path, model, optimizer, scheduler, epoch, global_step, args, metrics)
-        save_checkpoint(latest_path, model, optimizer, scheduler, epoch, global_step, args, metrics)
         if stop_training:
             print(f"stopped at max_steps={args.max_steps}")
             break

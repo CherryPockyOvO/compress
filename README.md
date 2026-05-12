@@ -152,6 +152,7 @@ python train.py \
   --val-dir data/val \
   --checkpoint-dir checkpoints_detail \
   --lpips-weight 0.03 \
+  --checkpoint-interval-steps 100 \
   --max-steps 3000
 ```
 
@@ -161,9 +162,12 @@ The `detail` preset expands to `lambda=0.020`, `target_bpp=1.0`,
 `lr=3e-5`, and `epochs=80`. The balanced preset uses `batch_size=128` with `crop_size=256`.
 Override any of these on the command line if your GPU memory or target bitrate
 needs a different tradeoff.
-For large datasets, prefer `--max-steps` over counting full epochs. With 50k
-images and `batch_size=64`, one epoch is about 782 optimizer steps, so
-`--max-steps 3000` is roughly 3.8 epochs.
+Checkpoints are saved by optimizer step, not by epoch: with the default
+`--checkpoint-interval-steps 100`, step 100 writes `e1.pt`, step 200 writes
+`e2.pt`, and so on. `latest.pt` is updated at the same save points. For large
+datasets, prefer `--max-steps` over counting full epochs. With 50k images and
+`batch_size=64`, one epoch is about 782 optimizer steps, so `--max-steps 3000`
+is roughly 3.8 epochs.
 
 Export and deploy the high-precision level from the new checkpoint directory:
 
