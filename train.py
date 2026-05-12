@@ -4,6 +4,7 @@ import argparse
 import math
 import random
 from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -22,6 +23,8 @@ DEFAULT_LAMBDA = 0.0067
 TRAIN_PROFILES = {
     "balanced": {
         "lmbda": DEFAULT_LAMBDA,
+        "rate_weight": 1.0,
+        "target_bpp": None,
         "ssim_weight": 0.2,
         "detail_weight": 0.0,
         "l1_weight": 0.0,
@@ -32,17 +35,25 @@ TRAIN_PROFILES = {
         "lr": 1e-4,
     },
     "detail": {
-        "lmbda": 0.0130,
-        "ssim_weight": 0.35,
-        "detail_weight": 0.12,
-        "l1_weight": 0.03,
-        "quant_step": 0.50,
+        "lmbda": 0.0200,
+        "rate_weight": 1.0,
+        "target_bpp": 0.75,
+        "ssim_weight": 0.40,
+        "detail_weight": 6.0,
+        "l1_weight": 0.50,
+        "quant_step": 0.45,
         "epochs": 80,
         "batch_size": 64,
         "crop_size": 384,
         "lr": 3e-5,
     },
 }
+
+
+@dataclass(frozen=True)
+class CheckpointState:
+    epoch: int
+    global_step: int
 
 
 class ImageFolderDataset(Dataset):
@@ -209,12 +220,16 @@ class RateDistortionLoss(nn.Module):
     def __init__(
         self,
         lmbda: float,
+        rate_weight: float = 1.0,
+        target_bpp: float | None = None,
         ssim_weight: float = 0.2,
         detail_weight: float = 0.0,
         l1_weight: float = 0.0,
     ) -> None:
         super().__init__()
         self.lmbda = float(lmbda)
+        self.rate_weight = float(rate_weight)
+        self.target_bpp = None if target_bpp is None else float(target_bpp)
         self.ssim_weight = float(ssim_weight)
         self.detail_weight = float(detail_weight)
         self.l1_weight = float(l1_weight)
@@ -224,6 +239,10 @@ class RateDistortionLoss(nn.Module):
         mse = F.mse_loss(x_hat, target)
         num_pixels = target.size(0) * target.size(2) * target.size(3)
         bpp = compute_bpp(output["likelihoods"], num_pixels)
+        if self.target_bpp is None:
+            rate_loss = bpp
+        else:
+            rate_loss = torch.relu(bpp - bpp.new_tensor(self.target_bpp))
         distortion = self.lmbda * (255.0**2) * mse
         ssim = ssim_index(x_hat, target)
         ssim_loss = 1.0 - ssim
@@ -234,7 +253,7 @@ class RateDistortionLoss(nn.Module):
             detail_loss = mse.new_zeros(())
         loss = (
             distortion
-            + bpp
+            + self.rate_weight * rate_loss
             + self.ssim_weight * ssim_loss
             + self.detail_weight * detail_loss
             + self.l1_weight * l1_loss
@@ -243,6 +262,7 @@ class RateDistortionLoss(nn.Module):
             "loss": loss,
             "mse": mse,
             "bpp": bpp,
+            "rate_loss": rate_loss,
             "ssim": ssim,
             "ssim_loss": ssim_loss,
             "detail_loss": detail_loss,
@@ -255,7 +275,7 @@ def load_checkpoint(
     model: nn.Module,
     optimizer: torch.optim.Optimizer | None = None,
     scheduler: torch.optim.lr_scheduler.ReduceLROnPlateau | None = None,
-) -> int:
+) -> CheckpointState:
     raw = torch.load(path, map_location="cpu")
     state_dict = raw.get("state_dict", raw) if isinstance(raw, dict) else raw
     model.load_state_dict(state_dict, strict=False)
@@ -263,7 +283,12 @@ def load_checkpoint(
         optimizer.load_state_dict(raw["optimizer"])
     if scheduler is not None and isinstance(raw, dict) and "scheduler" in raw:
         scheduler.load_state_dict(raw["scheduler"])
-    return int(raw.get("epoch", 0)) if isinstance(raw, dict) else 0
+    if isinstance(raw, dict):
+        return CheckpointState(
+            epoch=int(raw.get("epoch", 0)),
+            global_step=int(raw.get("global_step", 0)),
+        )
+    return CheckpointState(epoch=0, global_step=0)
 
 
 @torch.no_grad()
@@ -281,13 +306,17 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.ReduceLROnPlateau | None,
     epoch: int,
+    global_step: int,
     args: argparse.Namespace,
     metrics: dict[str, float],
 ) -> None:
     payload = {
         "epoch": epoch,
+        "global_step": global_step,
         "quality_profile": args.quality_profile,
         "lambda": args.lmbda,
+        "rate_weight": args.rate_weight,
+        "target_bpp": args.target_bpp,
         "ssim_weight": args.ssim_weight,
         "detail_weight": args.detail_weight,
         "l1_weight": args.l1_weight,
@@ -332,6 +361,19 @@ def make_autocast(enabled: bool):
     return nullcontext()
 
 
+def tensor_is_finite(value: torch.Tensor) -> bool:
+    return bool(torch.isfinite(value.detach()).all().item())
+
+
+def metrics_are_finite(metrics: dict[str, float]) -> bool:
+    return all(math.isfinite(value) for value in metrics.values())
+
+
+def model_parameters_are_finite(model: nn.Module) -> bool:
+    with torch.no_grad():
+        return all(torch.isfinite(param).all().item() for param in model.parameters())
+
+
 def train_one_epoch(
     model: FactorizedPriorNano,
     criterion: RateDistortionLoss,
@@ -341,16 +383,22 @@ def train_one_epoch(
     device: torch.device,
     grad_clip: float,
     amp_enabled: bool,
-) -> dict[str, float]:
+    global_step: int,
+    max_steps: int | None,
+) -> tuple[dict[str, float], int, bool]:
     model.train()
     totals = {
         "loss": 0.0,
         "mse": 0.0,
         "bpp": 0.0,
+        "rate_loss": 0.0,
         "ssim": 0.0,
         "detail_loss": 0.0,
         "l1_loss": 0.0,
     }
+    processed_samples = 0
+    skipped_batches = 0
+    stop_training = False
 
     for batch in loader:
         batch = batch.to(device, non_blocking=True)
@@ -360,18 +408,37 @@ def train_one_epoch(
             output = model(batch)
             losses = criterion(output, batch)
 
+        if not tensor_is_finite(losses["loss"]):
+            skipped_batches += 1
+            optimizer.zero_grad(set_to_none=True)
+            continue
+
         scaler.scale(losses["loss"]).backward()
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        if not tensor_is_finite(grad_norm):
+            skipped_batches += 1
+            optimizer.zero_grad(set_to_none=True)
+            scaler.update()
+            continue
+
         scaler.step(optimizer)
         scaler.update()
 
         batch_size = batch.size(0)
+        processed_samples += batch_size
+        global_step += 1
         for key in totals:
             totals[key] += float(losses[key].detach()) * batch_size
 
-    count = len(loader.dataset)
-    return {key: value / count for key, value in totals.items()}
+        if max_steps is not None and global_step >= max_steps:
+            stop_training = True
+            break
+
+    count = max(1, processed_samples)
+    metrics = {key: value / count for key, value in totals.items()}
+    metrics["skipped_batches"] = float(skipped_batches)
+    return metrics, global_step, stop_training
 
 
 @torch.no_grad()
@@ -386,21 +453,30 @@ def evaluate_loss(
         "loss": 0.0,
         "mse": 0.0,
         "bpp": 0.0,
+        "rate_loss": 0.0,
         "ssim": 0.0,
         "detail_loss": 0.0,
         "l1_loss": 0.0,
     }
+    processed_samples = 0
+    skipped_batches = 0
 
     for batch in loader:
         batch = batch.to(device, non_blocking=True)
         output = model(batch)
         losses = criterion(output, batch)
+        if not tensor_is_finite(losses["loss"]):
+            skipped_batches += 1
+            continue
         batch_size = batch.size(0)
+        processed_samples += batch_size
         for key in totals:
             totals[key] += float(losses[key].detach()) * batch_size
 
-    count = len(loader.dataset)
-    return {f"val_{key}": value / count for key, value in totals.items()}
+    count = max(1, processed_samples)
+    metrics = {f"val_{key}": value / count for key, value in totals.items()}
+    metrics["val_skipped_batches"] = float(skipped_batches)
+    return metrics
 
 
 def parse_args() -> argparse.Namespace:
@@ -414,6 +490,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-dir", type=Path, required=True)
     parser.add_argument("--val-dir", type=Path, default=None)
     parser.add_argument("--lambda", dest="lmbda", type=float, default=None)
+    parser.add_argument(
+        "--rate-weight",
+        type=float,
+        default=None,
+        help="Weight of the rate term. Lower values trade more bits for quality.",
+    )
+    parser.add_argument(
+        "--target-bpp",
+        type=float,
+        default=None,
+        help="If set, only penalize estimated bpp above this budget.",
+    )
     parser.add_argument("--ssim-weight", type=float, default=None)
     parser.add_argument(
         "--detail-weight",
@@ -434,6 +522,12 @@ def parse_args() -> argparse.Namespace:
         help="Override latent quantization step after model initialization/checkpoint load.",
     )
     parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="Stop after this many optimizer updates. This is useful for large datasets where epochs are too coarse.",
+    )
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--crop-size", type=int, default=None)
@@ -473,6 +567,14 @@ def apply_quality_profile(args: argparse.Namespace) -> None:
 
     if args.init_checkpoint is not None and args.resume is not None:
         raise ValueError("--init-checkpoint and --resume are mutually exclusive")
+    if args.epochs <= 0:
+        raise ValueError("--epochs must be positive")
+    if args.max_steps is not None and args.max_steps <= 0:
+        raise ValueError("--max-steps must be positive")
+    if args.rate_weight < 0:
+        raise ValueError("--rate-weight must be non-negative")
+    if args.target_bpp is not None and args.target_bpp < 0:
+        raise ValueError("--target-bpp must be non-negative")
     if args.detail_weight < 0:
         raise ValueError("--detail-weight must be non-negative")
     if args.l1_weight < 0:
@@ -529,6 +631,8 @@ def main() -> None:
     set_quant_step(model, args.quant_step)
     criterion = RateDistortionLoss(
         args.lmbda,
+        rate_weight=args.rate_weight,
+        target_bpp=args.target_bpp,
         ssim_weight=args.ssim_weight,
         detail_weight=args.detail_weight,
         l1_weight=args.l1_weight,
@@ -537,27 +641,43 @@ def main() -> None:
     scheduler = make_scheduler(optimizer, args)
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
+    global_step = 0
     start_epoch = 0
     if args.init_checkpoint is not None:
-        source_epoch = load_checkpoint(args.init_checkpoint, model)
+        state = load_checkpoint(args.init_checkpoint, model)
         set_quant_step(model, args.quant_step)
-        print(f"initialized weights: {args.init_checkpoint} (source epoch {source_epoch})")
+        print(f"initialized weights: {args.init_checkpoint} (source epoch {state.epoch})")
     elif args.resume is not None:
-        start_epoch = load_checkpoint(args.resume, model, optimizer, scheduler)
+        state = load_checkpoint(args.resume, model, optimizer, scheduler)
+        start_epoch = state.epoch
+        global_step = state.global_step or start_epoch * len(train_loader)
         set_quant_step(model, args.quant_step)
-        print(f"resumed: {args.resume} at epoch {start_epoch}")
+        print(f"resumed: {args.resume} at epoch {start_epoch}, step {global_step}")
 
     quant_step = float(model.entropy_bottleneck.quant_step.detach().cpu())
     print(
         f"profile={args.quality_profile}, train images={len(train_dataset)}, "
-        f"lambda={args.lmbda}, ssim_weight={args.ssim_weight}, "
+        f"steps_per_epoch={len(train_loader)}, "
+        f"lambda={args.lmbda}, rate_weight={args.rate_weight}, "
+        f"target_bpp={args.target_bpp}, ssim_weight={args.ssim_weight}, "
         f"detail_weight={args.detail_weight}, l1_weight={args.l1_weight}, "
         f"quant_step={quant_step}, crop={args.crop_size}, "
-        f"batch={args.batch_size}, lr={get_current_lr(optimizer):.2e}"
+        f"batch={args.batch_size}, max_steps={args.max_steps}, "
+        f"start_step={global_step}, lr={get_current_lr(optimizer):.2e}"
     )
 
-    for epoch in range(start_epoch + 1, args.epochs + 1):
-        train_metrics = train_one_epoch(
+    if args.max_steps is not None and global_step >= args.max_steps:
+        print(f"already reached max_steps={args.max_steps}; nothing to train")
+        return
+
+    end_epoch = args.epochs
+    if args.max_steps is not None:
+        remaining_steps = args.max_steps - global_step
+        needed_epochs = start_epoch + math.ceil(remaining_steps / len(train_loader))
+        end_epoch = max(end_epoch, needed_epochs)
+
+    for epoch in range(start_epoch + 1, end_epoch + 1):
+        train_metrics, global_step, stop_training = train_one_epoch(
             model,
             criterion,
             train_loader,
@@ -566,10 +686,19 @@ def main() -> None:
             device,
             args.grad_clip,
             amp_enabled,
+            global_step,
+            args.max_steps,
         )
         metrics = dict(train_metrics)
         if val_loader is not None:
             metrics.update(evaluate_loss(model, criterion, val_loader, device))
+
+        if not metrics_are_finite(metrics) or not model_parameters_are_finite(model):
+            print(
+                f"non-finite training state at epoch {epoch:03d}, step {global_step}; "
+                "checkpoint was not saved. Resume from the previous good epoch."
+            )
+            break
 
         monitor_name = "val_loss" if val_loader is not None else "loss"
         monitor_value = metrics[monitor_name]
@@ -583,12 +712,15 @@ def main() -> None:
         lr_text = ""
         if new_lr < old_lr:
             lr_text = f" | lr reduced: {old_lr:.2e} -> {new_lr:.2e}"
-        print(f"epoch {epoch:03d}: {metric_text} | monitor={monitor_name}{lr_text}")
+        print(f"epoch {epoch:03d} step {global_step}: {metric_text} | monitor={monitor_name}{lr_text}")
 
         epoch_path = args.checkpoint_dir / f"epoch{epoch:03d}.pt"
         latest_path = args.checkpoint_dir / "latest.pt"
-        save_checkpoint(epoch_path, model, optimizer, scheduler, epoch, args, metrics)
-        save_checkpoint(latest_path, model, optimizer, scheduler, epoch, args, metrics)
+        save_checkpoint(epoch_path, model, optimizer, scheduler, epoch, global_step, args, metrics)
+        save_checkpoint(latest_path, model, optimizer, scheduler, epoch, global_step, args, metrics)
+        if stop_training:
+            print(f"stopped at max_steps={args.max_steps}")
+            break
 
 
 if __name__ == "__main__":
