@@ -29,6 +29,8 @@ TRAIN_PROFILES = {
         "ssim_weight": 0.2,
         "detail_weight": 0.0,
         "l1_weight": 0.0,
+        "lpips_weight": 0.0,
+        "lpips_net": "alex",
         "quant_step": None,
         "epochs": 100,
         "batch_size": 128,
@@ -42,6 +44,8 @@ TRAIN_PROFILES = {
         "ssim_weight": 0.40,
         "detail_weight": 6.0,
         "l1_weight": 0.50,
+        "lpips_weight": 0.03,
+        "lpips_net": "alex",
         "quant_step": 0.45,
         "epochs": 80,
         "batch_size": 64,
@@ -217,6 +221,26 @@ def gradient_detail_loss(x_hat: torch.Tensor, target: torch.Tensor) -> torch.Ten
     )
 
 
+def make_lpips_model(net: str) -> nn.Module:
+    try:
+        import lpips
+    except ImportError as exc:
+        raise RuntimeError(
+            "LPIPS loss requires the 'lpips' package. "
+            "Install it with: python -m pip install lpips"
+        ) from exc
+
+    model = lpips.LPIPS(net=net, verbose=False)
+    model.eval()
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    return model
+
+
+def to_lpips_range(value: torch.Tensor) -> torch.Tensor:
+    return value.float().clamp(0.0, 1.0).mul(2.0).sub(1.0)
+
+
 class RateDistortionLoss(nn.Module):
     def __init__(
         self,
@@ -226,6 +250,8 @@ class RateDistortionLoss(nn.Module):
         ssim_weight: float = 0.2,
         detail_weight: float = 0.0,
         l1_weight: float = 0.0,
+        lpips_weight: float = 0.0,
+        lpips_net: str = "alex",
     ) -> None:
         super().__init__()
         self.lmbda = float(lmbda)
@@ -234,6 +260,9 @@ class RateDistortionLoss(nn.Module):
         self.ssim_weight = float(ssim_weight)
         self.detail_weight = float(detail_weight)
         self.l1_weight = float(l1_weight)
+        self.lpips_weight = float(lpips_weight)
+        self.lpips_net = lpips_net
+        self.lpips_model = make_lpips_model(lpips_net) if self.lpips_weight > 0 else None
 
     def forward(self, output: dict[str, Any], target: torch.Tensor) -> dict[str, torch.Tensor]:
         x_hat = output["x_hat"]
@@ -252,12 +281,25 @@ class RateDistortionLoss(nn.Module):
             detail_loss = gradient_detail_loss(x_hat, target)
         else:
             detail_loss = mse.new_zeros(())
+        if self.lpips_model is not None:
+            if x_hat.device.type == "cuda":
+                lpips_context = torch.amp.autocast("cuda", enabled=False)
+            else:
+                lpips_context = nullcontext()
+            with lpips_context:
+                lpips_loss = self.lpips_model(
+                    to_lpips_range(x_hat),
+                    to_lpips_range(target),
+                ).mean()
+        else:
+            lpips_loss = mse.new_zeros(())
         loss = (
             distortion
             + self.rate_weight * rate_loss
             + self.ssim_weight * ssim_loss
             + self.detail_weight * detail_loss
             + self.l1_weight * l1_loss
+            + self.lpips_weight * lpips_loss
         )
         return {
             "loss": loss,
@@ -268,6 +310,7 @@ class RateDistortionLoss(nn.Module):
             "ssim_loss": ssim_loss,
             "detail_loss": detail_loss,
             "l1_loss": l1_loss,
+            "lpips_loss": lpips_loss,
         }
 
 
@@ -321,6 +364,8 @@ def save_checkpoint(
         "ssim_weight": args.ssim_weight,
         "detail_weight": args.detail_weight,
         "l1_weight": args.l1_weight,
+        "lpips_weight": args.lpips_weight,
+        "lpips_net": args.lpips_net,
         "quant_step": float(model.entropy_bottleneck.quant_step.detach().cpu()),
         "encoder_activation": args.encoder_activation,
         "decoder_activation": args.decoder_activation,
@@ -354,6 +399,114 @@ def make_scheduler(
 
 def get_current_lr(optimizer: torch.optim.Optimizer) -> float:
     return float(optimizer.param_groups[0]["lr"])
+
+
+def psnr_from_mse(mse: float) -> float:
+    if mse <= 0.0:
+        return math.inf
+    return -10.0 * math.log10(mse)
+
+
+def format_primary_metrics(metrics: dict[str, float], prefix: str = "") -> str:
+    key = lambda name: f"{prefix}{name}" if prefix else name
+    mse = metrics[key("mse")]
+    psnr = psnr_from_mse(mse)
+    return (
+        f"loss={metrics[key('loss')]:.4f} "
+        f"bpp={metrics[key('bpp')]:.3f} "
+        f"mse={mse:.6f} "
+        f"psnr={psnr:.2f} "
+        f"ssim={metrics[key('ssim')]:.4f}"
+    )
+
+
+def format_detail_metrics(
+    metrics: dict[str, float],
+    prefix: str = "",
+    include_lpips: bool = False,
+) -> str:
+    key = lambda name: f"{prefix}{name}" if prefix else name
+    parts = [
+        f"rate={metrics[key('rate_loss')]:.4f}",
+        f"grad={metrics[key('detail_loss')]:.5f}",
+        f"l1={metrics[key('l1_loss')]:.5f}",
+    ]
+    if include_lpips or metrics.get(key("lpips_loss"), 0.0) > 0.0:
+        parts.append(f"lpips={metrics[key('lpips_loss')]:.5f}")
+    skipped_key = key("skipped_batches")
+    if metrics.get(skipped_key, 0.0) > 0.0:
+        parts.append(f"skipped={metrics[skipped_key]:.0f}")
+    return " ".join(parts)
+
+
+def format_epoch_summary(
+    epoch: int,
+    global_step: int,
+    metrics: dict[str, float],
+    monitor_name: str,
+    old_lr: float,
+    new_lr: float,
+    include_lpips: bool,
+) -> str:
+    primary_parts = [
+        f"epoch {epoch:03d} step {global_step}",
+        f"train {format_primary_metrics(metrics)}",
+    ]
+    if "val_loss" in metrics:
+        primary_parts.append(f"val {format_primary_metrics(metrics, 'val_')}")
+
+    detail_parts = [
+        f"train {format_detail_metrics(metrics, include_lpips=include_lpips)}",
+    ]
+    if "val_loss" in metrics:
+        detail_parts.append(
+            f"val {format_detail_metrics(metrics, 'val_', include_lpips=include_lpips)}"
+        )
+
+    lr_text = f"lr={new_lr:.2e} monitor={monitor_name}={metrics[monitor_name]:.4f}"
+    if new_lr < old_lr:
+        lr_text += f" reduced {old_lr:.2e}->{new_lr:.2e}"
+
+    return "\n".join(
+        [
+            " | ".join(primary_parts),
+            "  detail: " + " | ".join(detail_parts),
+            "  " + lr_text,
+        ]
+    )
+
+
+def print_run_config(
+    args: argparse.Namespace,
+    train_dataset: ImageFolderDataset,
+    train_loader: DataLoader,
+    val_loader: DataLoader | None,
+    model: FactorizedPriorNano,
+    optimizer: torch.optim.Optimizer,
+    amp_enabled: bool,
+    global_step: int,
+) -> None:
+    quant_step = float(model.entropy_bottleneck.quant_step.detach().cpu())
+    val_text = "none" if val_loader is None else str(len(val_loader.dataset))
+    lpips_text = "off"
+    if args.lpips_weight > 0:
+        lpips_text = f"{args.lpips_weight:g}/{args.lpips_net}"
+    print("run config:")
+    print(
+        f"  data: train={len(train_dataset)} val={val_text} "
+        f"batch={args.batch_size} crop={args.crop_size} workers={args.num_workers}"
+    )
+    print(
+        f"  objective: profile={args.quality_profile} lambda={args.lmbda:g} "
+        f"target_bpp={args.target_bpp} rate={args.rate_weight:g} "
+        f"ssim={args.ssim_weight:g} grad={args.detail_weight:g} "
+        f"l1={args.l1_weight:g} lpips={lpips_text} quant_step={quant_step:g}"
+    )
+    print(
+        f"  schedule: epochs={args.epochs} max_steps={args.max_steps} "
+        f"steps/epoch={len(train_loader)} start_step={global_step} "
+        f"lr={get_current_lr(optimizer):.2e} amp={amp_enabled}"
+    )
 
 
 def make_autocast(enabled: bool):
@@ -396,6 +549,7 @@ def train_one_epoch(
         "ssim": 0.0,
         "detail_loss": 0.0,
         "l1_loss": 0.0,
+        "lpips_loss": 0.0,
     }
     processed_samples = 0
     skipped_batches = 0
@@ -458,6 +612,7 @@ def evaluate_loss(
         "ssim": 0.0,
         "detail_loss": 0.0,
         "l1_loss": 0.0,
+        "lpips_loss": 0.0,
     }
     processed_samples = 0
     skipped_batches = 0
@@ -517,6 +672,18 @@ def parse_args() -> argparse.Namespace:
         help="Optional L1 reconstruction weight. Small values usually sharpen fine local contrast.",
     )
     parser.add_argument(
+        "--lpips-weight",
+        type=float,
+        default=None,
+        help="Optional LPIPS perceptual loss weight. Start around 0.03 for detail fine-tuning.",
+    )
+    parser.add_argument(
+        "--lpips-net",
+        choices=("alex", "vgg", "squeeze"),
+        default=None,
+        help="Backbone used by LPIPS when --lpips-weight is greater than zero.",
+    )
+    parser.add_argument(
         "--quant-step",
         type=float,
         default=None,
@@ -557,6 +724,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--encoder-activation", choices=("relu", "leaky_relu"), default="relu")
     parser.add_argument("--decoder-activation", choices=("relu", "leaky_relu"), default="leaky_relu")
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--log-style",
+        choices=("compact", "full"),
+        default="compact",
+        help="compact prints grouped epoch summaries; full prints every metric key.",
+    )
     return parser.parse_args()
 
 
@@ -580,6 +753,8 @@ def apply_quality_profile(args: argparse.Namespace) -> None:
         raise ValueError("--detail-weight must be non-negative")
     if args.l1_weight < 0:
         raise ValueError("--l1-weight must be non-negative")
+    if args.lpips_weight < 0:
+        raise ValueError("--lpips-weight must be non-negative")
     if args.quant_step is not None and args.quant_step <= 0:
         raise ValueError("--quant-step must be positive")
 
@@ -637,7 +812,9 @@ def main() -> None:
         ssim_weight=args.ssim_weight,
         detail_weight=args.detail_weight,
         l1_weight=args.l1_weight,
-    )
+        lpips_weight=args.lpips_weight,
+        lpips_net=args.lpips_net,
+    ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = make_scheduler(optimizer, args)
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
@@ -655,16 +832,15 @@ def main() -> None:
         set_quant_step(model, args.quant_step)
         print(f"resumed: {args.resume} at epoch {start_epoch}, step {global_step}")
 
-    quant_step = float(model.entropy_bottleneck.quant_step.detach().cpu())
-    print(
-        f"profile={args.quality_profile}, train images={len(train_dataset)}, "
-        f"steps_per_epoch={len(train_loader)}, "
-        f"lambda={args.lmbda}, rate_weight={args.rate_weight}, "
-        f"target_bpp={args.target_bpp}, ssim_weight={args.ssim_weight}, "
-        f"detail_weight={args.detail_weight}, l1_weight={args.l1_weight}, "
-        f"quant_step={quant_step}, crop={args.crop_size}, "
-        f"batch={args.batch_size}, max_steps={args.max_steps}, "
-        f"start_step={global_step}, lr={get_current_lr(optimizer):.2e}"
+    print_run_config(
+        args,
+        train_dataset,
+        train_loader,
+        val_loader,
+        model,
+        optimizer,
+        amp_enabled,
+        global_step,
     )
 
     if args.max_steps is not None and global_step >= args.max_steps:
@@ -709,11 +885,24 @@ def main() -> None:
         new_lr = get_current_lr(optimizer)
         metrics["lr"] = new_lr
 
-        metric_text = ", ".join(f"{key}={value:.6f}" for key, value in metrics.items())
-        lr_text = ""
-        if new_lr < old_lr:
-            lr_text = f" | lr reduced: {old_lr:.2e} -> {new_lr:.2e}"
-        print(f"epoch {epoch:03d} step {global_step}: {metric_text} | monitor={monitor_name}{lr_text}")
+        if args.log_style == "full":
+            metric_text = ", ".join(f"{key}={value:.6f}" for key, value in metrics.items())
+            lr_text = ""
+            if new_lr < old_lr:
+                lr_text = f" | lr reduced: {old_lr:.2e} -> {new_lr:.2e}"
+            print(f"epoch {epoch:03d} step {global_step}: {metric_text} | monitor={monitor_name}{lr_text}")
+        else:
+            print(
+                format_epoch_summary(
+                    epoch,
+                    global_step,
+                    metrics,
+                    monitor_name,
+                    old_lr,
+                    new_lr,
+                    include_lpips=(args.lpips_weight > 0),
+                )
+            )
 
         epoch_path = args.checkpoint_dir / f"epoch{epoch:03d}.pt"
         latest_path = args.checkpoint_dir / "latest.pt"
