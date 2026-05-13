@@ -6,6 +6,7 @@ import contextlib
 import datetime as _dt
 import io
 import json
+import multiprocessing as mp
 import shutil
 import subprocess
 import sys
@@ -195,6 +196,7 @@ def setup_model(
         device = torch.device(args.device)
 
     if device.type == "cuda":
+        torch.cuda.set_device(device)
         torch.backends.cudnn.benchmark = args.cudnn_benchmark
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -465,6 +467,368 @@ def decode_cnz_batch(
     return batch_records, ffmpeg_proc, expected_video_size, timings
 
 
+def decode_cnz_batch_to_raw(
+    batch_items: Sequence[Tuple[int, Path]],
+    real_count: int,
+    output_start_index: int,
+    args: argparse.Namespace,
+    model: Any,
+    device: Any,
+    torch_module: Any,
+    cnz_decoder: Any,
+) -> Tuple[List[Dict[str, Any]], List[bytes], Tuple[int, int], Dict[str, float]]:
+    torch = torch_module
+    total_t0 = cnz_decoder.now_synced(device)
+
+    unpack_t0 = cnz_decoder.now_synced(device)
+    y_hats = []
+    original_sizes: List[Tuple[int, int]] = []
+    for _, cnz_path in batch_items:
+        prefix = cnz_path.read_bytes()[:4]
+        if prefix != cnz_decoder.MAGIC:
+            raise ValueError("multi-GPU decode only supports CNZ4 files")
+        cnz_file = cnz_decoder.read_cnz_file(cnz_path)
+        y_hat = cnz_decoder.cnz_to_y_hat(cnz_file, device=device)
+        if args.half:
+            y_hat = y_hat.to(torch.float16)
+        y_hats.append(y_hat)
+        original_sizes.append((int(cnz_file.header.orig_h), int(cnz_file.header.orig_w)))
+
+    first_shape = tuple(y_hats[0].shape[1:])
+    if any(tuple(y_hat.shape[1:]) != first_shape for y_hat in y_hats):
+        raise ValueError("batch contains different latent shapes; use a smaller batch")
+
+    y_hat_batch = torch.cat(y_hats, dim=0)
+    if device.type == "cuda" and args.channels_last:
+        y_hat_batch = y_hat_batch.contiguous(memory_format=torch.channels_last)
+    unpack_t1 = cnz_decoder.now_synced(device)
+
+    torch_t0 = cnz_decoder.now_synced(device)
+    with torch.inference_mode():
+        with cnz_decoder.make_autocast(device, args.half):
+            x_hat_batch = model.decoder(y_hat_batch)
+    torch_t1 = cnz_decoder.now_synced(device)
+
+    crop_t0 = cnz_decoder.now_synced(device)
+    real_original_sizes = original_sizes[:real_count]
+    height, width = real_original_sizes[0]
+    if any(size != (height, width) for size in real_original_sizes):
+        raise ValueError("multi-GPU pipe-video requires all frames in a batch to share output size")
+    real_tensors = [
+        cnz_decoder.crop_to_size(x_hat_batch[i : i + 1], real_original_sizes[i])
+        for i in range(real_count)
+    ]
+    crop_t1 = cnz_decoder.now_synced(device)
+
+    raw_t0 = cnz_decoder.now_synced(device)
+    raw_frames = [
+        tensor_batch_to_uint8_nhwc(torch, tensor).numpy().tobytes()
+        for tensor in real_tensors
+    ]
+    raw_t1 = cnz_decoder.now_synced(device)
+
+    total_sec = raw_t1 - total_t0
+    timings = {
+        "decode_sec": total_sec,
+        "cnz_unpack_sec": unpack_t1 - unpack_t0,
+        "torch_decoder_sec": torch_t1 - torch_t0,
+        "crop_sec": crop_t1 - crop_t0,
+        "raw_rgb_sec": raw_t1 - raw_t0,
+    }
+    per_frame_total = total_sec / real_count
+    records: List[Dict[str, Any]] = []
+    for i, ((source_index, cnz_path), original_size) in enumerate(
+        zip(batch_items[:real_count], real_original_sizes)
+    ):
+        records.append(
+            {
+                "output_index": output_start_index + i,
+                "source_index": source_index,
+                "cnz": str(cnz_path),
+                "image": None,
+                "height": int(original_size[0]),
+                "width": int(original_size[1]),
+                "decode_sec": round(per_frame_total, 4),
+                "decode_fps": round(1.0 / per_frame_total, 4) if per_frame_total > 0 else 0.0,
+                "batch_size": real_count,
+                "decode_batch_size": len(batch_items),
+                "batch_decode_sec": round(total_sec, 4),
+                "cnz_unpack_sec": round(timings["cnz_unpack_sec"] / real_count, 4),
+                "torch_decoder_sec": round(timings["torch_decoder_sec"] / real_count, 4),
+                "crop_sec": round(timings["crop_sec"] / real_count, 4),
+                "save_or_pipe_sec": round(timings["raw_rgb_sec"] / real_count, 4),
+            }
+        )
+
+    timings["real_batch_size"] = float(real_count)
+    timings["decode_batch_size"] = float(len(batch_items))
+    return records, raw_frames, (height, width), timings
+
+
+def parse_devices(devices: Optional[str]) -> List[str]:
+    if devices is None:
+        return []
+    parsed = [item.strip() for item in devices.split(",") if item.strip()]
+    if not parsed:
+        raise ValueError("--devices cannot be empty")
+    return parsed
+
+
+def make_decode_batches(
+    cnz_files: Sequence[Tuple[int, Path]],
+    batch_size: int,
+    pad_last_batch: bool,
+) -> List[Dict[str, Any]]:
+    batches: List[Dict[str, Any]] = []
+    output_start = 0
+    for batch_id, batch_items in enumerate(batched(cnz_files, batch_size)):
+        real_count = len(batch_items)
+        decode_items = list(batch_items)
+        if (
+            pad_last_batch
+            and batch_size > 1
+            and real_count < batch_size
+            and len(cnz_files) >= batch_size
+        ):
+            decode_items.extend([batch_items[-1]] * (batch_size - real_count))
+        batches.append(
+            {
+                "batch_id": batch_id,
+                "output_start": output_start,
+                "real_count": real_count,
+                "decode_items": [(idx, str(path)) for idx, path in decode_items],
+            }
+        )
+        output_start += real_count
+    return batches
+
+
+def multi_gpu_decode_worker(
+    worker_id: int,
+    device_name: str,
+    task_queue: mp.Queue,
+    result_queue: mp.Queue,
+    config: Dict[str, Any],
+) -> None:
+    try:
+        torch_module, cnz_decoder, model_cls = load_decoder_modules()
+        worker_args = argparse.Namespace(
+            checkpoint=Path(config["checkpoint"]),
+            device=device_name,
+            cpu=False,
+            half=bool(config["half"]),
+            channels_last=bool(config["channels_last"]),
+            cudnn_benchmark=bool(config["cudnn_benchmark"]),
+            compile=bool(config["compile"]),
+            compile_mode=str(config["compile_mode"]),
+        )
+        model, device = setup_model(worker_args, torch_module, cnz_decoder, model_cls)
+        result_queue.put({"type": "ready", "worker_id": worker_id, "device": device_name})
+
+        decode_args = argparse.Namespace(
+            half=bool(config["half"]),
+            channels_last=bool(config["channels_last"]),
+        )
+        while True:
+            task = task_queue.get()
+            if task is None:
+                break
+            batch_items = [
+                (int(index), Path(path_text))
+                for index, path_text in task["decode_items"]
+            ]
+            records, raw_frames, size, timings = decode_cnz_batch_to_raw(
+                batch_items,
+                real_count=int(task["real_count"]),
+                output_start_index=int(task["output_start"]),
+                args=decode_args,
+                model=model,
+                device=device,
+                torch_module=torch_module,
+                cnz_decoder=cnz_decoder,
+            )
+            result_queue.put(
+                {
+                    "type": "batch",
+                    "worker_id": worker_id,
+                    "device": device_name,
+                    "batch_id": int(task["batch_id"]),
+                    "output_start": int(task["output_start"]),
+                    "real_count": int(task["real_count"]),
+                    "records": records,
+                    "raw_frames": raw_frames,
+                    "size": size,
+                    "timings": timings,
+                }
+            )
+    except Exception as exc:
+        result_queue.put(
+            {
+                "type": "error",
+                "worker_id": worker_id,
+                "device": device_name,
+                "error": str(exc),
+            }
+        )
+    finally:
+        result_queue.put({"type": "stopped", "worker_id": worker_id, "device": device_name})
+
+
+def run_multi_gpu_decode(
+    args: argparse.Namespace,
+    cnz_files: Sequence[Tuple[int, Path]],
+    fps: float,
+    decode_manifest_path: Path,
+    manifest: Dict[str, Any],
+    devices: Sequence[str],
+) -> None:
+    if not args.pipe_video:
+        raise ValueError("--devices multi-GPU mode requires --pipe-video")
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be > 0")
+
+    batches = make_decode_batches(cnz_files, args.batch_size, args.pad_last_batch)
+    context = mp.get_context("spawn")
+    task_queue: mp.Queue = context.Queue()
+    result_queue: mp.Queue = context.Queue()
+    config = {
+        "checkpoint": str(args.checkpoint),
+        "half": args.half,
+        "channels_last": args.channels_last,
+        "cudnn_benchmark": args.cudnn_benchmark,
+        "compile": args.compile,
+        "compile_mode": args.compile_mode,
+    }
+
+    workers = [
+        context.Process(
+            target=multi_gpu_decode_worker,
+            args=(worker_id, device_name, task_queue, result_queue, config),
+            daemon=False,
+        )
+        for worker_id, device_name in enumerate(devices)
+    ]
+    for worker in workers:
+        worker.start()
+    for task in batches:
+        task_queue.put(task)
+    for _ in workers:
+        task_queue.put(None)
+
+    ffmpeg_proc: Optional[subprocess.Popen[bytes]] = None
+    expected_video_size: Optional[Tuple[int, int]] = None
+    pending: Dict[int, Dict[str, Any]] = {}
+    next_batch_id = 0
+    completed_frames = 0
+    stopped = 0
+    started = time.perf_counter()
+    video_started = time.perf_counter()
+    frame_records: List[Dict[str, Any]] = []
+
+    def flush_ready() -> None:
+        nonlocal ffmpeg_proc, expected_video_size, next_batch_id, completed_frames
+        while next_batch_id in pending:
+            item = pending.pop(next_batch_id)
+            height, width = item["size"]
+            if expected_video_size is None:
+                expected_video_size = (height, width)
+                ffmpeg_proc = open_ffmpeg_raw_writer(
+                    args.output_video,
+                    width=width,
+                    height=height,
+                    fps=fps,
+                    args=args,
+                )
+            elif expected_video_size != (height, width):
+                raise ValueError("all frames must have the same size for multi-GPU pipe-video")
+            if ffmpeg_proc is None or ffmpeg_proc.stdin is None:
+                raise RuntimeError("ffmpeg stdin is unavailable")
+            for raw_frame in item["raw_frames"]:
+                ffmpeg_proc.stdin.write(raw_frame)
+            frame_records.extend(item["records"])
+            manifest["frames"] = frame_records
+            completed_frames += int(item["real_count"])
+            elapsed = time.perf_counter() - started
+            avg_fps = completed_frames / elapsed if elapsed > 0 else 0.0
+            timings = item["timings"]
+            records = item["records"]
+            first = records[0]["output_index"]
+            last = records[-1]["output_index"]
+            print(
+                f"[{completed_frames}/{len(cnz_files)}] frames {first:08d}-{last:08d} "
+                f"gpu={item['device']} batch={item['real_count']} "
+                f"decode={timings['decode_sec']:.3f}s "
+                f"unpack={timings['cnz_unpack_sec']:.3f}s "
+                f"torch={timings['torch_decoder_sec']:.3f}s "
+                f"raw={timings['raw_rgb_sec']:.3f}s "
+                f"avg_fps={avg_fps:.2f}"
+            )
+            manifest["elapsed_sec"] = round(elapsed, 4)
+            manifest["avg_decode_fps"] = round(avg_fps, 4)
+            write_json(decode_manifest_path, manifest)
+            next_batch_id += 1
+
+    try:
+        while stopped < len(workers):
+            item = result_queue.get()
+            item_type = item.get("type")
+            if item_type == "ready":
+                print(f"worker {item['worker_id']} ready on {item['device']}")
+            elif item_type == "stopped":
+                stopped += 1
+            elif item_type == "error":
+                raise RuntimeError(f"worker {item.get('worker_id')} {item.get('device')}: {item.get('error')}")
+            elif item_type == "batch":
+                pending[int(item["batch_id"])] = item
+                flush_ready()
+
+        flush_ready()
+        if completed_frames != len(cnz_files):
+            raise RuntimeError(f"decoded {completed_frames} frames, expected {len(cnz_files)}")
+    finally:
+        for worker in workers:
+            if worker.is_alive():
+                worker.join(timeout=1)
+            if worker.is_alive():
+                worker.terminate()
+
+    if ffmpeg_proc is None:
+        raise RuntimeError("no frames were decoded")
+
+    ffmpeg_finalize_t0 = time.perf_counter()
+    if ffmpeg_proc.stdin is not None:
+        ffmpeg_proc.stdin.close()
+    ret = ffmpeg_proc.wait()
+    if ret != 0:
+        raise RuntimeError(f"ffmpeg failed with exit code {ret}")
+
+    total_sec = time.perf_counter() - started
+    finalize_sec = time.perf_counter() - ffmpeg_finalize_t0
+    manifest["pipe_decode_and_video_sec"] = round(time.perf_counter() - video_started, 4)
+    manifest["video_encode_sec"] = round(finalize_sec, 4)
+    manifest["total_sec"] = round(total_sec, 4)
+    manifest["avg_decode_fps"] = round(len(cnz_files) / total_sec, 4) if total_sec > 0 else 0.0
+    for key in ("cnz_unpack_sec", "torch_decoder_sec", "save_or_pipe_sec"):
+        values = [
+            record[key]
+            for record in frame_records
+            if isinstance(record.get(key), (int, float))
+        ]
+        manifest[f"avg_{key}"] = round(sum(values) / len(values), 4) if values else None
+    write_json(decode_manifest_path, manifest)
+
+    print(f"ffmpeg_finalize_time={finalize_sec:.3f}s")
+    print(
+        "avg_decode_stage_time: "
+        f"unpack={fmt_sec(manifest.get('avg_cnz_unpack_sec'))}, "
+        f"torch={fmt_sec(manifest.get('avg_torch_decoder_sec'))}, "
+        f"raw_pipe={fmt_sec(manifest.get('avg_save_or_pipe_sec'))}"
+    )
+    print(f"done: {len(cnz_files)} frames, total_time={total_sec:.3f}s")
+    print(f"saved_video: {args.output_video}")
+    print(f"decode_manifest: {decode_manifest_path}")
+
+
 def build_video(
     decoded_dir: Path,
     image_format: str,
@@ -539,6 +903,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--image-format", choices=["png", "jpg"], default="png")
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
+    parser.add_argument(
+        "--devices",
+        default=None,
+        help="Comma-separated CUDA devices for multi-GPU decode, e.g. cuda:0,cuda:1,cuda:2.",
+    )
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--half", action="store_true", help="Use CUDA FP16 decoder.")
     parser.add_argument(
@@ -599,6 +968,9 @@ def main() -> None:
     cnz_files, rk_manifest = collect_cnz_files(args.input)
     fps = args.fps or fps_from_manifest(rk_manifest) or 30.0
     args.resolved_fps = fps
+    multi_devices = parse_devices(args.devices)
+    if multi_devices and any(not device.startswith("cuda") for device in multi_devices):
+        raise ValueError("--devices only supports CUDA devices, e.g. cuda:0,cuda:1,cuda:2")
 
     if not args.pipe_video:
         args.decoded_dir.mkdir(parents=True, exist_ok=True)
@@ -613,9 +985,8 @@ def main() -> None:
     print(f"output_video: {args.output_video}")
     print(f"fps: {fps:.6f}")
     print(f"batch_size: {args.batch_size}")
-
-    torch_module, cnz_decoder, model_cls = load_decoder_modules()
-    model, device = setup_model(args, torch_module, cnz_decoder, model_cls)
+    if multi_devices:
+        print(f"devices: {','.join(multi_devices)}")
 
     manifest: Dict[str, Any] = {
         "format": "pc-cnz-folder-video-decode-v1",
@@ -625,11 +996,20 @@ def main() -> None:
         "decoded_dir": None if args.pipe_video else str(args.decoded_dir),
         "output_video": str(args.output_video),
         "fps": fps,
-        "device": str(device),
+        "device": None,
+        "devices": multi_devices or None,
         "batch_size": args.batch_size,
         "pipe_video": args.pipe_video,
         "frames": [],
     }
+
+    if multi_devices:
+        run_multi_gpu_decode(args, cnz_files, fps, decode_manifest_path, manifest, multi_devices)
+        return
+
+    torch_module, cnz_decoder, model_cls = load_decoder_modules()
+    model, device = setup_model(args, torch_module, cnz_decoder, model_cls)
+    manifest["device"] = str(device)
 
     total_t0 = time.perf_counter()
     ffmpeg_proc: Optional[subprocess.Popen[bytes]] = None

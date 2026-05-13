@@ -192,6 +192,16 @@ For short clips, if the first CUDA batch is much slower than later batches, try:
 --no-cudnn-benchmark
 ```
 
+Use multiple local GPUs:
+
+```bash
+python3 rk3588_media_compress/pc_decode_cnz_video.py --input out_cnz --checkpoint best2.pt --output-video recon.mp4 --fps 30 --devices cuda:0,cuda:1,cuda:2 --half --batch-size 4 --pipe-video --preset ultrafast --overwrite
+```
+
+In multi-GPU mode, each GPU loads one decoder copy and processes batches in
+parallel. The main process writes decoded raw RGB frames to `ffmpeg` in the
+original frame order.
+
 Delete decoded PNG frames after the video is written:
 
 ```bash
