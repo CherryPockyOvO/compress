@@ -207,6 +207,11 @@ def setup_model(
         if device.type != "cuda":
             raise RuntimeError("--half is only supported with CUDA")
         model = model.half()
+    if args.compile:
+        if not hasattr(torch, "compile"):
+            raise RuntimeError("--compile requires PyTorch 2.x")
+        model.decoder = torch.compile(model.decoder, mode=args.compile_mode)
+        print(f"torch_compile: enabled mode={args.compile_mode}")
 
     t0 = cnz_decoder.now_synced(device)
     cnz_decoder.load_checkpoint(model, args.checkpoint)
@@ -366,6 +371,8 @@ def decode_cnz_batch(
         raise ValueError("batch contains different latent shapes; use --batch-size 1")
 
     y_hat_batch = torch.cat(y_hats, dim=0)
+    if device.type == "cuda" and args.channels_last:
+        y_hat_batch = y_hat_batch.contiguous(memory_format=torch.channels_last)
     unpack_t1 = cnz_decoder.now_synced(device)
 
     torch_t0 = cnz_decoder.now_synced(device)
@@ -521,6 +528,16 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Use channels-last memory format on CUDA.",
     )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Compile the PyTorch decoder. First run is slower; repeated/long runs can be faster.",
+    )
+    parser.add_argument(
+        "--compile-mode",
+        choices=["default", "reduce-overhead", "max-autotune"],
+        default="reduce-overhead",
+    )
     parser.add_argument("--ffmpeg", default="ffmpeg")
     parser.add_argument("--video-codec", default="libx264")
     parser.add_argument("--crf", type=int, default=18)
@@ -548,6 +565,11 @@ def main() -> None:
         raise ValueError("--fps must be > 0")
     if args.batch_size <= 0:
         raise ValueError("--batch-size must be > 0")
+    if args.batch_size > 16:
+        print(
+            "warning: very large --batch-size can be slower for 720p+ frames because "
+            "decoder feature tensors become huge. Try 4, 8, or 16 and compare."
+        )
 
     cnz_files, rk_manifest = collect_cnz_files(args.input)
     fps = args.fps or fps_from_manifest(rk_manifest) or 30.0
@@ -656,16 +678,21 @@ def main() -> None:
 
     if args.pipe_video:
         assert ffmpeg_proc is not None
+        ffmpeg_finalize_t0 = time.perf_counter()
         if ffmpeg_proc.stdin is not None:
             ffmpeg_proc.stdin.close()
         ret = ffmpeg_proc.wait()
         if ret != 0:
             raise RuntimeError(f"ffmpeg failed with exit code {ret}")
-        video_sec = time.perf_counter() - video_t0
+        video_sec = time.perf_counter() - ffmpeg_finalize_t0
+        pipe_total_sec = time.perf_counter() - video_t0
     else:
         video_sec = build_video(args.decoded_dir, args.image_format, args.output_video, fps, args)
+        pipe_total_sec = None
     total_sec = time.perf_counter() - total_t0
     manifest["video_encode_sec"] = round(video_sec, 4)
+    if pipe_total_sec is not None:
+        manifest["pipe_decode_and_video_sec"] = round(pipe_total_sec, 4)
     manifest["total_sec"] = round(total_sec, 4)
     manifest["avg_decode_fps"] = round(len(cnz_files) / total_sec, 4) if total_sec > 0 else 0.0
     frame_records = manifest["frames"]
@@ -691,7 +718,10 @@ def main() -> None:
         shutil.rmtree(args.decoded_dir)
         print(f"removed decoded frames: {args.decoded_dir}")
 
-    print(f"video_encode_time={video_sec:.3f}s")
+    if args.pipe_video:
+        print(f"ffmpeg_finalize_time={video_sec:.3f}s")
+    else:
+        print(f"video_encode_time={video_sec:.3f}s")
     if frame_records:
         print(
             "avg_decode_stage_time: "
