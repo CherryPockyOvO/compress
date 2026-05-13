@@ -178,21 +178,46 @@ Only rank 0 prints progress and writes `eN.pt`, `latest.pt`, and `best.pt`.
 
 The `detail` preset expands to `lambda=0.05`, `target_bpp=None`,
 `rate_weight=0.25`, `ssim_weight=0.05`, `detail_weight=1.5`,
-`highlight_weight=1.0`, `l1_weight=0.10`, `lpips_weight=0.003`,
+`highlight_weight=1.0`, `highlight_under_weight=1.0`,
+`highlight_lap_weight=0.8`, `texture_lap_weight=1.0`,
+`texture_contrast_weight=0.4`, `l1_weight=0.10`, `lpips_weight=0.003`,
 `quant_step=0.50`, `crop_size=384`, `batch_size=32`, `lr=1e-5`, and
 `epochs=80`. The balanced preset uses `batch_size=128` with `crop_size=256`.
 Override any of these on the command line if your GPU memory or target bitrate
 needs a different tradeoff.
-If water ripples or highlights are still too weak, try:
+
+For high-bpp highlight peak and edge fine-tuning from an existing detail
+checkpoint, use `detail_peak`. It keeps `quant_step=0.50`, lowers the learning
+rate to `5e-6`, and raises `detail_weight=1.8` plus `highlight_weight=1.5`:
 
 ```bash
---highlight-weight 1.5 --detail-weight 2.0 --rate-weight 0.2 --quant-step 0.45
+python train.py \
+  --quality-profile detail_peak \
+  --init-checkpoint checkpoints_detail/best.pt \
+  --train-dir data/train \
+  --val-dir data/val \
+  --checkpoint-dir checkpoints_detail_peak \
+  --checkpoint-interval-steps 100 \
+  --max-steps 2000
+```
+
+Watch `val_peak_under`, `val_highlight_lap`, `val_highlight_contrast`, and
+`val_lpips_loss`. If water ripples or highlights are still too weak, try:
+
+```bash
+--highlight-under-weight 1.3 --highlight-weight 1.5
+```
+
+If highlights are bright enough but edges are still soft, try:
+
+```bash
+--highlight-lap-weight 1.0 --texture-lap-weight 1.2 --texture-contrast-weight 0.5
 ```
 
 If you see halo artifacts, false highlights, or white edge fringing, try:
 
 ```bash
---highlight-weight 0.5 --detail-weight 1.0 --rate-weight 0.3 --quant-step 0.55
+--highlight-weight 1.0 --highlight-under-weight 0.7 --highlight-lap-weight 0.8 --texture-contrast-weight 0.4
 ```
 
 Checkpoints are saved by optimizer step, not by epoch: with the default

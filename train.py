@@ -35,6 +35,10 @@ TRAIN_PROFILES = {
         "ssim_weight": 0.2,
         "detail_weight": 0.0,
         "highlight_weight": 0.0,
+        "highlight_under_weight": 1.0,
+        "highlight_lap_weight": 0.8,
+        "texture_lap_weight": 1.0,
+        "texture_contrast_weight": 0.4,
         "l1_weight": 0.0,
         "lpips_weight": 0.0,
         "lpips_net": "alex",
@@ -51,6 +55,10 @@ TRAIN_PROFILES = {
         "ssim_weight": 0.05,
         "detail_weight": 1.5,
         "highlight_weight": 1.0,
+        "highlight_under_weight": 1.0,
+        "highlight_lap_weight": 0.8,
+        "texture_lap_weight": 1.0,
+        "texture_contrast_weight": 0.4,
         "l1_weight": 0.10,
         "lpips_weight": 0.003,
         "lpips_net": "alex",
@@ -59,6 +67,26 @@ TRAIN_PROFILES = {
         "batch_size": 32,
         "crop_size": 384,
         "lr": 1e-5,
+    },
+    "detail_peak": {
+        "lmbda": 0.05,
+        "rate_weight": 0.25,
+        "target_bpp": None,
+        "ssim_weight": 0.05,
+        "detail_weight": 1.8,
+        "highlight_weight": 1.5,
+        "highlight_under_weight": 1.0,
+        "highlight_lap_weight": 0.8,
+        "texture_lap_weight": 1.0,
+        "texture_contrast_weight": 0.4,
+        "l1_weight": 0.10,
+        "lpips_weight": 0.003,
+        "lpips_net": "alex",
+        "quant_step": 0.50,
+        "epochs": 80,
+        "batch_size": 32,
+        "crop_size": 384,
+        "lr": 5e-6,
     },
 }
 
@@ -511,7 +539,10 @@ def make_highlight_focus_weight(
         return focus.clamp(0.0, 8.0), peak.clamp(0.0, 1.0)
 
 
-def highlight_aware_loss(x_hat: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def highlight_aware_terms(
+    x_hat: torch.Tensor,
+    target: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     focus_weight, peak_weight = make_highlight_focus_weight(target)
 
     rgb_l1 = (focus_weight * torch.abs(x_hat - target)).mean()
@@ -525,10 +556,43 @@ def highlight_aware_loss(x_hat: torch.Tensor, target: torch.Tensor) -> torch.Ten
     lap_loss = (focus_weight * torch.abs(lap_hat - lap_tgt)).mean()
 
     under_loss = (peak_weight * torch.relu(y_tgt - y_hat)).mean()
-    return rgb_l1 + 0.75 * luma_l1 + 0.5 * lap_loss + 0.5 * under_loss
+    return rgb_l1, luma_l1, lap_loss, under_loss
 
 
-def highlight_texture_loss(x_hat: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def combine_highlight_aware_terms(
+    terms: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    under_weight: float = 1.0,
+    lap_weight: float = 0.8,
+    peak_under_weight: float | None = None,
+) -> torch.Tensor:
+    if peak_under_weight is not None:
+        under_weight = peak_under_weight
+    rgb_l1, luma_l1, lap_loss, under_loss = terms
+    return rgb_l1 + 0.75 * luma_l1 + float(lap_weight) * lap_loss + float(under_weight) * under_loss
+
+
+def highlight_aware_loss(
+    x_hat: torch.Tensor,
+    target: torch.Tensor,
+    under_weight: float = 1.0,
+    lap_weight: float = 0.8,
+    peak_under_weight: float | None = None,
+) -> torch.Tensor:
+    if peak_under_weight is not None:
+        under_weight = peak_under_weight
+    return combine_highlight_aware_terms(
+        highlight_aware_terms(x_hat, target),
+        under_weight=under_weight,
+        lap_weight=lap_weight,
+    )
+
+
+def highlight_texture_loss(
+    x_hat: torch.Tensor,
+    target: torch.Tensor,
+    texture_lap_weight: float = 1.0,
+    texture_contrast_weight: float = 0.4,
+) -> torch.Tensor:
     weight = make_highlight_texture_weight(target)
     l1 = (weight * torch.abs(x_hat - target)).mean()
 
@@ -544,7 +608,7 @@ def highlight_texture_loss(x_hat: torch.Tensor, target: torch.Tensor) -> torch.T
     std_tgt = torch.sqrt(F.avg_pool2d((y_tgt - mu_tgt) ** 2, 7, 1, 3) + 1e-6)
     contrast_loss = (weight * torch.abs(std_hat - std_tgt)).mean()
 
-    return l1 + 0.8 * lap_loss + 0.3 * contrast_loss
+    return l1 + float(texture_lap_weight) * lap_loss + float(texture_contrast_weight) * contrast_loss
 
 
 def gradient_detail_loss(x_hat: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -569,8 +633,53 @@ def gradient_detail_loss(x_hat: torch.Tensor, target: torch.Tensor) -> torch.Ten
     )
 
 
-def detail_reconstruction_loss(x_hat: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    return highlight_texture_loss(x_hat, target) + 0.2 * gradient_detail_loss(x_hat, target)
+def detail_reconstruction_loss(
+    x_hat: torch.Tensor,
+    target: torch.Tensor,
+    texture_lap_weight: float = 1.0,
+    texture_contrast_weight: float = 0.4,
+) -> torch.Tensor:
+    return (
+        highlight_texture_loss(
+            x_hat,
+            target,
+            texture_lap_weight=texture_lap_weight,
+            texture_contrast_weight=texture_contrast_weight,
+        )
+        + 0.2 * gradient_detail_loss(x_hat, target)
+    )
+
+
+def local_luma_std(y: torch.Tensor) -> torch.Tensor:
+    mu = F.avg_pool2d(y, kernel_size=7, stride=1, padding=3)
+    return torch.sqrt(F.avg_pool2d((y - mu) ** 2, 7, 1, 3) + 1e-6)
+
+
+def highlight_quality_metrics(
+    x_hat: torch.Tensor,
+    target: torch.Tensor,
+    peak_threshold: float = 0.88,
+    highlight_threshold: float = 0.72,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    with torch.no_grad():
+        y_hat = rgb_to_luma(x_hat.detach().clamp(0.0, 1.0))
+        y_tgt = rgb_to_luma(target.detach().clamp(0.0, 1.0))
+
+        peak_mask = (y_tgt > peak_threshold).to(dtype=y_tgt.dtype)
+        peak_denom = peak_mask.sum() + 1e-6
+        peak_under = (peak_mask * torch.relu(y_tgt - y_hat)).sum() / peak_denom
+
+        highlight_mask = (y_tgt > highlight_threshold).to(dtype=y_tgt.dtype)
+        highlight_denom = highlight_mask.sum() + 1e-6
+        lap_metric = (
+            highlight_mask * torch.abs(laplacian_map(y_hat) - laplacian_map(y_tgt))
+        ).sum() / highlight_denom
+
+        contrast_metric = (
+            highlight_mask * torch.abs(local_luma_std(y_hat) - local_luma_std(y_tgt))
+        ).sum() / highlight_denom
+
+    return peak_under, lap_metric, contrast_metric
 
 
 def make_lpips_model(net: str) -> nn.Module:
@@ -602,6 +711,10 @@ class RateDistortionLoss(nn.Module):
         ssim_weight: float = 0.2,
         detail_weight: float = 0.0,
         highlight_weight: float = 0.0,
+        highlight_under_weight: float = 1.0,
+        highlight_lap_weight: float = 0.8,
+        texture_lap_weight: float = 1.0,
+        texture_contrast_weight: float = 0.4,
         l1_weight: float = 0.0,
         lpips_weight: float = 0.0,
         lpips_net: str = "alex",
@@ -613,6 +726,10 @@ class RateDistortionLoss(nn.Module):
         self.ssim_weight = float(ssim_weight)
         self.detail_weight = float(detail_weight)
         self.highlight_weight = float(highlight_weight)
+        self.highlight_under_weight = float(highlight_under_weight)
+        self.highlight_lap_weight = float(highlight_lap_weight)
+        self.texture_lap_weight = float(texture_lap_weight)
+        self.texture_contrast_weight = float(texture_contrast_weight)
         self.l1_weight = float(l1_weight)
         self.lpips_weight = float(lpips_weight)
         self.lpips_net = lpips_net
@@ -633,13 +750,26 @@ class RateDistortionLoss(nn.Module):
         ssim_loss = 1.0 - ssim
         l1_loss = F.l1_loss(x_hat, target)
         if self.detail_weight > 0:
-            detail_loss = detail_reconstruction_loss(x_hat, target)
+            detail_loss = detail_reconstruction_loss(
+                x_hat,
+                target,
+                texture_lap_weight=self.texture_lap_weight,
+                texture_contrast_weight=self.texture_contrast_weight,
+            )
         else:
             detail_loss = mse.new_zeros(())
         if self.highlight_weight > 0:
-            highlight_loss = highlight_aware_loss(x_hat, target)
+            highlight_terms = highlight_aware_terms(x_hat, target)
+            highlight_loss = combine_highlight_aware_terms(
+                highlight_terms,
+                under_weight=self.highlight_under_weight,
+                lap_weight=self.highlight_lap_weight,
+            )
+            highlight_under_loss = highlight_terms[3]
         else:
             highlight_loss = mse.new_zeros(())
+            highlight_under_loss = mse.new_zeros(())
+        peak_under, highlight_lap, highlight_contrast = highlight_quality_metrics(x_hat, target)
         if self.lpips_model is not None:
             if x_hat.device.type == "cuda":
                 lpips_context = torch.amp.autocast("cuda", enabled=False)
@@ -671,6 +801,10 @@ class RateDistortionLoss(nn.Module):
             "ssim_loss": ssim_loss,
             "detail_loss": detail_loss,
             "highlight_loss": highlight_loss,
+            "highlight_under_loss": highlight_under_loss,
+            "peak_under": peak_under,
+            "highlight_lap": highlight_lap,
+            "highlight_contrast": highlight_contrast,
             "l1_loss": l1_loss,
             "lpips_loss": lpips_loss,
         }
@@ -727,6 +861,11 @@ def save_checkpoint(
         "ssim_weight": args.ssim_weight,
         "detail_weight": args.detail_weight,
         "highlight_weight": args.highlight_weight,
+        "highlight_under_weight": args.highlight_under_weight,
+        "highlight_peak_under_weight": args.highlight_under_weight,
+        "highlight_lap_weight": args.highlight_lap_weight,
+        "texture_lap_weight": args.texture_lap_weight,
+        "texture_contrast_weight": args.texture_contrast_weight,
         "l1_weight": args.l1_weight,
         "lpips_weight": args.lpips_weight,
         "lpips_net": args.lpips_net,
@@ -794,6 +933,9 @@ def format_detail_metrics(
         f"rate={metrics[key('rate_loss')]:.4f}",
         f"grad={metrics[key('detail_loss')]:.5f}",
         f"hi={metrics[key('highlight_loss')]:.5f}",
+        f"peak_under={metrics[key('peak_under')]:.5f}",
+        f"hi_lap={metrics[key('highlight_lap')]:.5f}",
+        f"hi_contrast={metrics[key('highlight_contrast')]:.5f}",
         f"l1={metrics[key('l1_loss')]:.5f}",
     ]
     if all(key(name) in metrics for name in ("bpp_min", "bpp_max", "bpp_std")):
@@ -883,7 +1025,9 @@ def print_run_config(
         f"  objective: profile={args.quality_profile} lambda={args.lmbda:g} "
         f"target_bpp={args.target_bpp} rate={args.rate_weight:g} "
         f"ssim={args.ssim_weight:g} grad={args.detail_weight:g} "
-        f"highlight={args.highlight_weight:g} l1={args.l1_weight:g} "
+        f"highlight={args.highlight_weight:g} under={args.highlight_under_weight:g} "
+        f"hi_lap={args.highlight_lap_weight:g} texture_lap={args.texture_lap_weight:g} "
+        f"texture_contrast={args.texture_contrast_weight:g} l1={args.l1_weight:g} "
         f"lpips={lpips_text} quant_step={quant_step:g}"
     )
     print(
@@ -942,6 +1086,10 @@ def train_one_epoch(
         "ssim": 0.0,
         "detail_loss": 0.0,
         "highlight_loss": 0.0,
+        "highlight_under_loss": 0.0,
+        "peak_under": 0.0,
+        "highlight_lap": 0.0,
+        "highlight_contrast": 0.0,
         "l1_loss": 0.0,
         "lpips_loss": 0.0,
     }
@@ -1082,6 +1230,10 @@ def evaluate_loss(
         "ssim": 0.0,
         "detail_loss": 0.0,
         "highlight_loss": 0.0,
+        "highlight_under_loss": 0.0,
+        "peak_under": 0.0,
+        "highlight_lap": 0.0,
+        "highlight_contrast": 0.0,
         "l1_loss": 0.0,
         "lpips_loss": 0.0,
     }
@@ -1168,6 +1320,50 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Weight for the explicit highlight-aware loss. Use >0 to focus "
             "fine-tuning on bright edges, reflections, and specular texture."
+        ),
+    )
+    parser.add_argument(
+        "--highlight-peak-under-weight",
+        type=float,
+        default=None,
+        help=(
+            "Deprecated alias for --highlight-under-weight.",
+        ),
+    )
+    parser.add_argument(
+        "--highlight-under-weight",
+        type=float,
+        default=None,
+        help=(
+            "Internal weight for penalizing under-reconstructed strong highlight "
+            "peaks inside --highlight-weight."
+        ),
+    )
+    parser.add_argument(
+        "--highlight-lap-weight",
+        type=float,
+        default=None,
+        help=(
+            "Internal Laplacian weight inside --highlight-weight for bright "
+            "edge and water-ripple sharpness."
+        ),
+    )
+    parser.add_argument(
+        "--texture-lap-weight",
+        type=float,
+        default=None,
+        help=(
+            "Laplacian weight inside --detail-weight for highlight texture "
+            "and thin reflective edges."
+        ),
+    )
+    parser.add_argument(
+        "--texture-contrast-weight",
+        type=float,
+        default=None,
+        help=(
+            "Local luminance contrast weight inside --detail-weight for "
+            "bright texture retention."
         ),
     )
     parser.add_argument(
@@ -1262,9 +1458,13 @@ def parse_args() -> argparse.Namespace:
 
 def apply_quality_profile(args: argparse.Namespace) -> None:
     profile = TRAIN_PROFILES[args.quality_profile]
+    legacy_highlight_under_weight = args.highlight_peak_under_weight
     for key, value in profile.items():
         if getattr(args, key) is None:
             setattr(args, key, value)
+    if legacy_highlight_under_weight is not None:
+        args.highlight_under_weight = legacy_highlight_under_weight
+    args.highlight_peak_under_weight = args.highlight_under_weight
 
     if args.init_checkpoint is not None and args.resume is not None:
         raise ValueError("--init-checkpoint and --resume are mutually exclusive")
@@ -1284,6 +1484,14 @@ def apply_quality_profile(args: argparse.Namespace) -> None:
         raise ValueError("--detail-weight must be non-negative")
     if args.highlight_weight < 0:
         raise ValueError("--highlight-weight must be non-negative")
+    if args.highlight_under_weight < 0:
+        raise ValueError("--highlight-under-weight must be non-negative")
+    if args.highlight_lap_weight < 0:
+        raise ValueError("--highlight-lap-weight must be non-negative")
+    if args.texture_lap_weight < 0:
+        raise ValueError("--texture-lap-weight must be non-negative")
+    if args.texture_contrast_weight < 0:
+        raise ValueError("--texture-contrast-weight must be non-negative")
     if args.l1_weight < 0:
         raise ValueError("--l1-weight must be non-negative")
     if args.lpips_weight < 0:
@@ -1373,6 +1581,10 @@ def main() -> None:
             ssim_weight=args.ssim_weight,
             detail_weight=args.detail_weight,
             highlight_weight=args.highlight_weight,
+            highlight_under_weight=args.highlight_under_weight,
+            highlight_lap_weight=args.highlight_lap_weight,
+            texture_lap_weight=args.texture_lap_weight,
+            texture_contrast_weight=args.texture_contrast_weight,
             l1_weight=args.l1_weight,
             lpips_weight=args.lpips_weight,
             lpips_net=args.lpips_net,
