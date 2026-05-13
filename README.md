@@ -159,6 +159,23 @@ python train.py \
   --max-steps 5000
 ```
 
+For three local GPUs, launch the same run with PyTorch DDP:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2 torchrun --standalone --nproc_per_node=3 train.py \
+  --quality-profile detail \
+  --init-checkpoint checkpoints/latest.pt \
+  --train-dir data/train \
+  --val-dir data/val \
+  --checkpoint-dir checkpoints_detail \
+  --checkpoint-interval-steps 100 \
+  --max-steps 5000
+```
+
+In DDP mode `--batch-size` is per GPU. The `detail` preset uses
+`batch_size=32`, so three GPUs train with an effective global batch of 96.
+Only rank 0 prints progress and writes `eN.pt`, `latest.pt`, and `best.pt`.
+
 The `detail` preset expands to `lambda=0.05`, `target_bpp=None`,
 `rate_weight=0.25`, `ssim_weight=0.05`, `detail_weight=1.5`,
 `highlight_weight=1.0`, `l1_weight=0.10`, `lpips_weight=0.003`,

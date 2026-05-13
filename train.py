@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import random
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -9,11 +10,14 @@ from pathlib import Path
 from typing import Any, Callable
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image, ImageOps
 Image.MAX_IMAGE_PIXELS = None
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from compressai_nano import FactorizedPriorNano
@@ -65,6 +69,18 @@ class CheckpointState:
     global_step: int
 
 
+@dataclass(frozen=True)
+class DistributedContext:
+    enabled: bool
+    rank: int = 0
+    local_rank: int = 0
+    world_size: int = 1
+
+    @property
+    def is_main(self) -> bool:
+        return self.rank == 0
+
+
 @dataclass
 class RunningBppStats:
     minimum: float = math.inf
@@ -96,6 +112,137 @@ class RunningBppStats:
         metrics[key("bpp_min")] = self.minimum
         metrics[key("bpp_max")] = self.maximum
         metrics[key("bpp_std")] = math.sqrt(variance)
+
+
+def read_env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return int(value)
+
+
+def init_distributed() -> DistributedContext:
+    world_size = read_env_int("WORLD_SIZE", 1)
+    rank = read_env_int("RANK", 0)
+    local_rank = read_env_int("LOCAL_RANK", 0)
+    if world_size <= 1:
+        return DistributedContext(enabled=False)
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("Distributed training requires CUDA. Launch with one process per GPU.")
+    if local_rank >= torch.cuda.device_count():
+        raise RuntimeError(
+            f"LOCAL_RANK={local_rank} but only {torch.cuda.device_count()} CUDA devices are visible"
+        )
+
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl", init_method="env://")
+    return DistributedContext(
+        enabled=True,
+        rank=rank,
+        local_rank=local_rank,
+        world_size=world_size,
+    )
+
+
+def cleanup_distributed(distributed: DistributedContext) -> None:
+    if distributed.enabled and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def distributed_device(distributed: DistributedContext) -> torch.device:
+    if distributed.enabled:
+        return torch.device("cuda", distributed.local_rank)
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def all_reduce_bool(value: bool, device: torch.device, distributed: DistributedContext) -> bool:
+    if not distributed.enabled:
+        return value
+    flag = torch.tensor(1 if value else 0, dtype=torch.int32, device=device)
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+    return bool(flag.item())
+
+
+def add_reduced_bpp_stats(
+    metrics: dict[str, float],
+    stats: RunningBppStats,
+    device: torch.device,
+    distributed: DistributedContext,
+    prefix: str = "",
+) -> None:
+    if not distributed.enabled:
+        stats.add_to(metrics, prefix=prefix)
+        return
+
+    key = lambda name: f"{prefix}{name}" if prefix else name
+    count = int(stats.count)
+
+    minimum = torch.tensor(
+        stats.minimum if count > 0 else math.inf,
+        dtype=torch.float64,
+        device=device,
+    )
+    maximum = torch.tensor(
+        stats.maximum if count > 0 else -math.inf,
+        dtype=torch.float64,
+        device=device,
+    )
+    sums = torch.tensor(
+        [stats.total, stats.total_sq, float(count)],
+        dtype=torch.float64,
+        device=device,
+    )
+
+    dist.all_reduce(minimum, op=dist.ReduceOp.MIN)
+    dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
+    dist.all_reduce(sums, op=dist.ReduceOp.SUM)
+
+    global_count = int(sums[2].item())
+    if global_count == 0:
+        metrics[key("bpp_min")] = 0.0
+        metrics[key("bpp_max")] = 0.0
+        metrics[key("bpp_std")] = 0.0
+        return
+
+    mean = sums[0].item() / global_count
+    variance = max(0.0, sums[1].item() / global_count - mean * mean)
+    metrics[key("bpp_min")] = float(minimum.item())
+    metrics[key("bpp_max")] = float(maximum.item())
+    metrics[key("bpp_std")] = math.sqrt(variance)
+
+
+def average_reduced_metrics(
+    totals: dict[str, float],
+    processed_samples: int,
+    skipped_batches: int,
+    bpp_stats: RunningBppStats,
+    device: torch.device,
+    distributed: DistributedContext,
+    prefix: str = "",
+) -> dict[str, float]:
+    keys = list(totals.keys())
+    values = [totals[key] for key in keys]
+    values.extend([float(processed_samples), float(skipped_batches)])
+    reduced = torch.tensor(values, dtype=torch.float64, device=device)
+    if distributed.enabled:
+        dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
+
+    sample_count = max(1.0, float(reduced[len(keys)].item()))
+    key_name = lambda name: f"{prefix}{name}" if prefix else name
+    metrics = {
+        key_name(key): float(reduced[index].item() / sample_count)
+        for index, key in enumerate(keys)
+    }
+    metrics[key_name("skipped_batches")] = float(reduced[len(keys) + 1].item())
+    add_reduced_bpp_stats(metrics, bpp_stats, device, distributed, prefix=prefix)
+    return metrics
+
+
+def unwrap_model(model: nn.Module) -> nn.Module:
+    if isinstance(model, DistributedDataParallel):
+        return model.module
+    return model
 
 
 class ImageFolderDataset(Dataset):
@@ -569,6 +716,7 @@ def save_checkpoint(
     args: argparse.Namespace,
     metrics: dict[str, float],
 ) -> None:
+    model = unwrap_model(model)
     payload = {
         "epoch": epoch,
         "global_step": global_step,
@@ -711,17 +859,26 @@ def print_run_config(
     optimizer: torch.optim.Optimizer,
     amp_enabled: bool,
     global_step: int,
+    distributed: DistributedContext,
 ) -> None:
+    model = unwrap_model(model)
     quant_step = float(model.entropy_bottleneck.quant_step.detach().cpu())
     val_text = "none" if val_loader is None else str(len(val_loader.dataset))
+    global_batch = args.batch_size * distributed.world_size
     lpips_text = "off"
     if args.lpips_weight > 0:
         lpips_text = f"{args.lpips_weight:g}/{args.lpips_net}"
     print("run config:")
     print(
         f"  data: train={len(train_dataset)} val={val_text} "
-        f"batch={args.batch_size} crop={args.crop_size} workers={args.num_workers}"
+        f"batch_per_gpu={args.batch_size} global_batch={global_batch} "
+        f"crop={args.crop_size} workers_per_rank={args.num_workers}"
     )
+    if distributed.enabled:
+        print(
+            f"  distributed: ddp world_size={distributed.world_size} "
+            f"rank={distributed.rank} local_rank={distributed.local_rank}"
+        )
     print(
         f"  objective: profile={args.quality_profile} lambda={args.lmbda:g} "
         f"target_bpp={args.target_bpp} rate={args.rate_weight:g} "
@@ -760,7 +917,7 @@ def model_parameters_are_finite(model: nn.Module) -> bool:
 
 
 def train_one_epoch(
-    model: FactorizedPriorNano,
+    model: nn.Module,
     criterion: RateDistortionLoss,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
@@ -774,6 +931,7 @@ def train_one_epoch(
     checkpoint_interval_steps: int,
     progress_enabled: bool,
     on_checkpoint: Callable[[int, int, dict[str, float]], bool] | None,
+    distributed: DistributedContext,
 ) -> tuple[dict[str, float], int, bool]:
     model.train()
     totals = {
@@ -807,7 +965,7 @@ def train_one_epoch(
         unit="step",
         dynamic_ncols=True,
         leave=False,
-        disable=not progress_enabled,
+        disable=not (progress_enabled and distributed.is_main),
     )
 
     for batch in progress:
@@ -818,7 +976,12 @@ def train_one_epoch(
             output = model(batch)
             losses = criterion(output, batch)
 
-        if not tensor_is_finite(losses["loss"]):
+        loss_is_finite = all_reduce_bool(
+            tensor_is_finite(losses["loss"]),
+            device,
+            distributed,
+        )
+        if not loss_is_finite:
             skipped_batches += 1
             interval_skipped_batches += 1
             optimizer.zero_grad(set_to_none=True)
@@ -828,7 +991,12 @@ def train_one_epoch(
         scaler.scale(losses["loss"]).backward()
         scaler.unscale_(optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        if not tensor_is_finite(grad_norm):
+        grad_is_finite = all_reduce_bool(
+            tensor_is_finite(grad_norm),
+            device,
+            distributed,
+        )
+        if not grad_is_finite:
             skipped_batches += 1
             interval_skipped_batches += 1
             optimizer.zero_grad(set_to_none=True)
@@ -864,12 +1032,14 @@ def train_one_epoch(
             and (global_step % checkpoint_interval_steps == 0 or reached_max_steps)
         )
         if should_checkpoint and on_checkpoint is not None:
-            interval_count = max(1, interval_samples)
-            interval_metrics = {
-                key: value / interval_count for key, value in interval_totals.items()
-            }
-            interval_metrics["skipped_batches"] = float(interval_skipped_batches)
-            interval_bpp_stats.add_to(interval_metrics)
+            interval_metrics = average_reduced_metrics(
+                interval_totals,
+                interval_samples,
+                interval_skipped_batches,
+                interval_bpp_stats,
+                device,
+                distributed,
+            )
             if not on_checkpoint(epoch, global_step, interval_metrics):
                 stop_training = True
                 break
@@ -883,20 +1053,25 @@ def train_one_epoch(
             stop_training = True
             break
 
-    count = max(1, processed_samples)
-    metrics = {key: value / count for key, value in totals.items()}
-    metrics["skipped_batches"] = float(skipped_batches)
-    bpp_stats.add_to(metrics)
+    metrics = average_reduced_metrics(
+        totals,
+        processed_samples,
+        skipped_batches,
+        bpp_stats,
+        device,
+        distributed,
+    )
     return metrics, global_step, stop_training
 
 
 @torch.no_grad()
 def evaluate_loss(
-    model: FactorizedPriorNano,
+    model: nn.Module,
     criterion: RateDistortionLoss,
     loader: DataLoader,
     device: torch.device,
     progress_enabled: bool = True,
+    distributed: DistributedContext = DistributedContext(enabled=False),
 ) -> dict[str, float]:
     model.eval()
     totals = {
@@ -920,13 +1095,18 @@ def evaluate_loss(
         unit="batch",
         dynamic_ncols=True,
         leave=False,
-        disable=not progress_enabled,
+        disable=not (progress_enabled and distributed.is_main),
     )
     for batch in progress:
         batch = batch.to(device, non_blocking=True)
         output = model(batch)
         losses = criterion(output, batch)
-        if not tensor_is_finite(losses["loss"]):
+        loss_is_finite = all_reduce_bool(
+            tensor_is_finite(losses["loss"]),
+            device,
+            distributed,
+        )
+        if not loss_is_finite:
             skipped_batches += 1
             progress.set_postfix(skipped=skipped_batches)
             continue
@@ -940,11 +1120,15 @@ def evaluate_loss(
             bpp=f"{float(losses['bpp'].detach()):.3f}",
         )
 
-    count = max(1, processed_samples)
-    metrics = {f"val_{key}": value / count for key, value in totals.items()}
-    metrics["val_skipped_batches"] = float(skipped_batches)
-    bpp_stats.add_to(metrics, prefix="val_")
-    return metrics
+    return average_reduced_metrics(
+        totals,
+        processed_samples,
+        skipped_batches,
+        bpp_stats,
+        device,
+        distributed,
+        prefix="val_",
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -1061,6 +1245,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decoder-activation", choices=("relu", "leaky_relu"), default="leaky_relu")
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
+        "--local-rank",
+        type=int,
+        default=None,
+        help="Ignored compatibility flag for torchrun/launch; LOCAL_RANK env is used.",
+    )
+    parser.add_argument(
         "--log-style",
         choices=("compact", "full"),
         default="compact",
@@ -1105,198 +1295,294 @@ def apply_quality_profile(args: argparse.Namespace) -> None:
 def main() -> None:
     args = parse_args()
     apply_quality_profile(args)
+    distributed = init_distributed()
 
-    random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    try:
+        random.seed(args.seed + distributed.rank)
+        torch.manual_seed(args.seed + distributed.rank)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    amp_enabled = bool(args.amp and device.type == "cuda")
-    if device.type == "cuda":
-        torch.backends.cudnn.benchmark = True
-        print(f"device: cuda ({torch.cuda.get_device_name(0)})")
-    else:
-        print("device: cpu")
+        device = distributed_device(distributed)
+        amp_enabled = bool(args.amp and device.type == "cuda")
+        if device.type == "cuda":
+            torch.backends.cudnn.benchmark = True
+            if distributed.is_main:
+                print(f"device: cuda ({torch.cuda.get_device_name(device)})")
+        elif distributed.is_main:
+            print("device: cpu")
 
-    transform = make_train_transform(args.crop_size, args.quality_profile)
-    train_dataset = ImageFolderDataset(args.train_dir, transform=transform)
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-        drop_last=False,
-    )
-
-    val_loader = None
-    if args.val_dir is not None:
-        val_dataset = ImageFolderDataset(
-            args.val_dir,
-            transform=make_eval_transform(args.crop_size),
+        transform = make_train_transform(args.crop_size, args.quality_profile)
+        train_dataset = ImageFolderDataset(args.train_dir, transform=transform)
+        train_sampler = (
+            DistributedSampler(
+                train_dataset,
+                num_replicas=distributed.world_size,
+                rank=distributed.rank,
+                shuffle=True,
+                seed=args.seed,
+                drop_last=False,
+            )
+            if distributed.enabled
+            else None
         )
-        val_loader = DataLoader(
-            val_dataset,
+        train_loader = DataLoader(
+            train_dataset,
             batch_size=args.batch_size,
-            shuffle=False,
+            shuffle=(train_sampler is None),
+            sampler=train_sampler,
             num_workers=args.num_workers,
             pin_memory=(device.type == "cuda"),
             drop_last=False,
         )
 
-    model = FactorizedPriorNano(
-        activation=args.encoder_activation,
-        decoder_activation=args.decoder_activation,
-    ).to(device)
-    set_quant_step(model, args.quant_step)
-    criterion = RateDistortionLoss(
-        args.lmbda,
-        rate_weight=args.rate_weight,
-        target_bpp=args.target_bpp,
-        ssim_weight=args.ssim_weight,
-        detail_weight=args.detail_weight,
-        highlight_weight=args.highlight_weight,
-        l1_weight=args.l1_weight,
-        lpips_weight=args.lpips_weight,
-        lpips_net=args.lpips_net,
-    ).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = make_scheduler(optimizer, args)
-    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
-
-    global_step = 0
-    start_epoch = 0
-    if args.init_checkpoint is not None:
-        state = load_checkpoint(args.init_checkpoint, model)
-        set_quant_step(model, args.quant_step)
-        print(f"initialized weights: {args.init_checkpoint} (source epoch {state.epoch})")
-    elif args.resume is not None:
-        state = load_checkpoint(args.resume, model, optimizer, scheduler)
-        start_epoch = state.epoch
-        global_step = state.global_step or start_epoch * len(train_loader)
-        set_quant_step(model, args.quant_step)
-        print(f"resumed: {args.resume} at epoch {start_epoch}, step {global_step}")
-
-    print_run_config(
-        args,
-        train_dataset,
-        train_loader,
-        val_loader,
-        model,
-        optimizer,
-        amp_enabled,
-        global_step,
-    )
-
-    if args.max_steps is not None and global_step >= args.max_steps:
-        print(f"already reached max_steps={args.max_steps}; nothing to train")
-        return
-
-    end_epoch = args.epochs
-    if args.max_steps is not None:
-        remaining_steps = args.max_steps - global_step
-        needed_epochs = start_epoch + math.ceil(remaining_steps / len(train_loader))
-        end_epoch = max(end_epoch, needed_epochs)
-
-    last_checkpoint_step = global_step
-    best_val_loss = math.inf
-
-    def save_step_checkpoint(
-        epoch: int,
-        step: int,
-        train_metrics: dict[str, float],
-    ) -> bool:
-        nonlocal best_val_loss, last_checkpoint_step
-
-        metrics = dict(train_metrics)
-        is_final_step = args.max_steps is not None and step >= args.max_steps
-        should_eval = (
-            val_loader is not None
-            and args.eval_interval_steps > 0
-            and (step % args.eval_interval_steps == 0 or is_final_step)
-        )
-        if should_eval:
-            metrics.update(evaluate_loss(model, criterion, val_loader, device, args.progress))
-
-        if not metrics_are_finite(metrics) or not model_parameters_are_finite(model):
-            tqdm.write(
-                f"non-finite training state at epoch {epoch:03d}, step {step}; "
-                "checkpoint was not saved. Resume from the previous good checkpoint."
+        val_loader = None
+        if args.val_dir is not None:
+            val_dataset = ImageFolderDataset(
+                args.val_dir,
+                transform=make_eval_transform(args.crop_size),
             )
-            return False
-
-        monitor_name = "val_loss" if "val_loss" in metrics else "loss"
-        monitor_value = metrics[monitor_name]
-        old_lr = get_current_lr(optimizer)
-        if scheduler is not None and (val_loader is None or should_eval):
-            scheduler.step(monitor_value)
-        new_lr = get_current_lr(optimizer)
-        metrics["lr"] = new_lr
-
-        checkpoint_index = max(1, math.ceil(step / args.checkpoint_interval_steps))
-        checkpoint_name = f"e{checkpoint_index}.pt"
-        checkpoint_path = args.checkpoint_dir / checkpoint_name
-        latest_path = args.checkpoint_dir / "latest.pt"
-        best_path = args.checkpoint_dir / "best.pt"
-        improved = "val_loss" in metrics and metrics["val_loss"] < best_val_loss
-
-        if args.log_style == "full":
-            metric_text = ", ".join(f"{key}={value:.6f}" for key, value in metrics.items())
-            lr_text = ""
-            if new_lr < old_lr:
-                lr_text = f" | lr reduced: {old_lr:.2e} -> {new_lr:.2e}"
-            best_text = " | best" if improved else ""
-            tqdm.write(
-                f"{checkpoint_name} epoch {epoch:03d} step {step}: "
-                f"{metric_text} | monitor={monitor_name}{lr_text}{best_text}"
+            val_sampler = (
+                DistributedSampler(
+                    val_dataset,
+                    num_replicas=distributed.world_size,
+                    rank=distributed.rank,
+                    shuffle=False,
+                    drop_last=False,
+                )
+                if distributed.enabled
+                else None
             )
-        else:
-            summary = format_checkpoint_summary(
-                checkpoint_name,
-                epoch,
-                step,
-                metrics,
-                monitor_name,
-                old_lr,
-                new_lr,
-                include_lpips=(args.lpips_weight > 0),
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=args.batch_size,
+                shuffle=False,
+                sampler=val_sampler,
+                num_workers=args.num_workers,
+                pin_memory=(device.type == "cuda"),
+                drop_last=False,
             )
+
+        base_model = FactorizedPriorNano(
+            activation=args.encoder_activation,
+            decoder_activation=args.decoder_activation,
+        ).to(device)
+        set_quant_step(base_model, args.quant_step)
+        criterion = RateDistortionLoss(
+            args.lmbda,
+            rate_weight=args.rate_weight,
+            target_bpp=args.target_bpp,
+            ssim_weight=args.ssim_weight,
+            detail_weight=args.detail_weight,
+            highlight_weight=args.highlight_weight,
+            l1_weight=args.l1_weight,
+            lpips_weight=args.lpips_weight,
+            lpips_net=args.lpips_net,
+        ).to(device)
+
+        model: nn.Module = base_model
+        if distributed.enabled:
+            model = DistributedDataParallel(
+                base_model,
+                device_ids=[distributed.local_rank],
+                output_device=distributed.local_rank,
+            )
+
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+        scheduler = make_scheduler(optimizer, args)
+        scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
+
+        global_step = 0
+        start_epoch = 0
+        if args.init_checkpoint is not None:
+            state = load_checkpoint(args.init_checkpoint, base_model)
+            set_quant_step(base_model, args.quant_step)
+            if distributed.is_main:
+                print(f"initialized weights: {args.init_checkpoint} (source epoch {state.epoch})")
+        elif args.resume is not None:
+            state = load_checkpoint(args.resume, base_model, optimizer, scheduler)
+            start_epoch = state.epoch
+            global_step = state.global_step or start_epoch * len(train_loader)
+            set_quant_step(base_model, args.quant_step)
+            if distributed.is_main:
+                print(f"resumed: {args.resume} at epoch {start_epoch}, step {global_step}")
+
+        if distributed.is_main:
+            print_run_config(
+                args,
+                train_dataset,
+                train_loader,
+                val_loader,
+                base_model,
+                optimizer,
+                amp_enabled,
+                global_step,
+                distributed,
+            )
+
+        if args.max_steps is not None and global_step >= args.max_steps:
+            if distributed.is_main:
+                print(f"already reached max_steps={args.max_steps}; nothing to train")
+            return
+
+        end_epoch = args.epochs
+        if args.max_steps is not None:
+            remaining_steps = args.max_steps - global_step
+            needed_epochs = start_epoch + math.ceil(remaining_steps / len(train_loader))
+            end_epoch = max(end_epoch, needed_epochs)
+
+        last_checkpoint_step = global_step
+        best_val_loss = math.inf
+
+        def save_step_checkpoint(
+            epoch: int,
+            step: int,
+            train_metrics: dict[str, float],
+        ) -> bool:
+            nonlocal best_val_loss, last_checkpoint_step
+
+            metrics = dict(train_metrics)
+            is_final_step = args.max_steps is not None and step >= args.max_steps
+            should_eval = (
+                val_loader is not None
+                and args.eval_interval_steps > 0
+                and (step % args.eval_interval_steps == 0 or is_final_step)
+            )
+            if should_eval:
+                metrics.update(
+                    evaluate_loss(
+                        model,
+                        criterion,
+                        val_loader,
+                        device,
+                        args.progress,
+                        distributed,
+                    )
+                )
+
+            local_state_is_finite = metrics_are_finite(metrics) and model_parameters_are_finite(
+                base_model
+            )
+            state_is_finite = all_reduce_bool(local_state_is_finite, device, distributed)
+            if not state_is_finite:
+                if distributed.is_main:
+                    tqdm.write(
+                        f"non-finite training state at epoch {epoch:03d}, step {step}; "
+                        "checkpoint was not saved. Resume from the previous good checkpoint."
+                    )
+                return False
+
+            monitor_name = "val_loss" if "val_loss" in metrics else "loss"
+            monitor_value = metrics[monitor_name]
+            old_lr = get_current_lr(optimizer)
+            if scheduler is not None and (val_loader is None or should_eval):
+                scheduler.step(monitor_value)
+            new_lr = get_current_lr(optimizer)
+            metrics["lr"] = new_lr
+
+            checkpoint_index = max(1, math.ceil(step / args.checkpoint_interval_steps))
+            checkpoint_name = f"e{checkpoint_index}.pt"
+            checkpoint_path = args.checkpoint_dir / checkpoint_name
+            latest_path = args.checkpoint_dir / "latest.pt"
+            best_path = args.checkpoint_dir / "best.pt"
+            improved = "val_loss" in metrics and metrics["val_loss"] < best_val_loss
+
+            if distributed.is_main:
+                if args.log_style == "full":
+                    metric_text = ", ".join(
+                        f"{key}={value:.6f}" for key, value in metrics.items()
+                    )
+                    lr_text = ""
+                    if new_lr < old_lr:
+                        lr_text = f" | lr reduced: {old_lr:.2e} -> {new_lr:.2e}"
+                    best_text = " | best" if improved else ""
+                    tqdm.write(
+                        f"{checkpoint_name} epoch {epoch:03d} step {step}: "
+                        f"{metric_text} | monitor={monitor_name}{lr_text}{best_text}"
+                    )
+                else:
+                    summary = format_checkpoint_summary(
+                        checkpoint_name,
+                        epoch,
+                        step,
+                        metrics,
+                        monitor_name,
+                        old_lr,
+                        new_lr,
+                        include_lpips=(args.lpips_weight > 0),
+                    )
+                    if improved:
+                        summary += "\n  best: updated best.pt"
+                    tqdm.write(summary)
+
+                save_checkpoint(
+                    checkpoint_path,
+                    base_model,
+                    optimizer,
+                    scheduler,
+                    epoch,
+                    step,
+                    args,
+                    metrics,
+                )
+                save_checkpoint(
+                    latest_path,
+                    base_model,
+                    optimizer,
+                    scheduler,
+                    epoch,
+                    step,
+                    args,
+                    metrics,
+                )
+                if improved:
+                    save_checkpoint(
+                        best_path,
+                        base_model,
+                        optimizer,
+                        scheduler,
+                        epoch,
+                        step,
+                        args,
+                        metrics,
+                    )
+
             if improved:
-                summary += "\n  best: updated best.pt"
-            tqdm.write(summary)
+                best_val_loss = metrics["val_loss"]
+            last_checkpoint_step = step
+            if distributed.enabled:
+                dist.barrier()
+            return True
 
-        save_checkpoint(checkpoint_path, model, optimizer, scheduler, epoch, step, args, metrics)
-        save_checkpoint(latest_path, model, optimizer, scheduler, epoch, step, args, metrics)
-        if improved:
-            best_val_loss = metrics["val_loss"]
-            save_checkpoint(best_path, model, optimizer, scheduler, epoch, step, args, metrics)
-        last_checkpoint_step = step
-        return True
+        for epoch in range(start_epoch + 1, end_epoch + 1):
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
+            train_metrics, global_step, stop_training = train_one_epoch(
+                model,
+                criterion,
+                train_loader,
+                optimizer,
+                scaler,
+                device,
+                args.grad_clip,
+                amp_enabled,
+                epoch,
+                global_step,
+                args.max_steps,
+                args.checkpoint_interval_steps,
+                args.progress,
+                save_step_checkpoint,
+                distributed,
+            )
 
-    for epoch in range(start_epoch + 1, end_epoch + 1):
-        train_metrics, global_step, stop_training = train_one_epoch(
-            model,
-            criterion,
-            train_loader,
-            optimizer,
-            scaler,
-            device,
-            args.grad_clip,
-            amp_enabled,
-            epoch,
-            global_step,
-            args.max_steps,
-            args.checkpoint_interval_steps,
-            args.progress,
-            save_step_checkpoint,
-        )
+            if epoch == end_epoch and global_step != last_checkpoint_step:
+                if not save_step_checkpoint(epoch, global_step, train_metrics):
+                    break
 
-        if epoch == end_epoch and global_step != last_checkpoint_step:
-            if not save_step_checkpoint(epoch, global_step, train_metrics):
+            if stop_training:
+                if distributed.is_main:
+                    print(f"stopped at max_steps={args.max_steps}")
                 break
-
-        if stop_training:
-            print(f"stopped at max_steps={args.max_steps}")
-            break
+    finally:
+        cleanup_distributed(distributed)
 
 
 if __name__ == "__main__":
