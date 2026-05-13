@@ -138,11 +138,14 @@ python val.py --data-dir D:\data\images\test --checkpoint checkpoints\latest.pt 
 ### High-Precision Detail Fine-Tuning
 
 Use this when you already have a trained `.pt` at the current quality level and
-want a second, higher-bpp level with better hair, edge, and texture retention.
+want a second, higher-bpp level with better water highlights, thin bright lines,
+and local texture retention.
 The preset keeps the same model tensor shapes, so old compatible checkpoints can
-be used as the starting point. It raises the distortion target, adds Sobel
-gradient detail loss, adds a small L1 term, and lowers the latent quantization
-step.
+be used as the starting point. The `detail` objective is now highlight-aware,
+high-frequency-aware, and local-contrast-aware: it upweights bright high-frequency
+regions, matches Laplacian texture, and preserves local luminance contrast. The
+training cropper also samples a minority of patches near bright or high-frequency
+regions while keeping ordinary random crops as the default behavior.
 
 ```bash
 python train.py \
@@ -151,23 +154,34 @@ python train.py \
   --train-dir data/train \
   --val-dir data/val \
   --checkpoint-dir checkpoints_detail \
-  --lpips-weight 0.03 \
   --checkpoint-interval-steps 100 \
-  --max-steps 3000
+  --max-steps 5000
 ```
 
-The `detail` preset expands to `lambda=0.0932`, `target_bpp=1.0`,
-`rate_weight=1.0`, `ssim_weight=0.40`, `detail_weight=6.0`, `l1_weight=0.50`,
-`lpips_weight=0.03`, `quant_step=0.45`, `crop_size=384`, `batch_size=64`,
-`lr=3e-5`, and `epochs=80`. The balanced preset uses `batch_size=128` with `crop_size=256`.
+The `detail` preset expands to `lambda=0.05`, `target_bpp=None`,
+`rate_weight=0.25`, `ssim_weight=0.05`, `detail_weight=1.5`, `l1_weight=0.10`,
+`lpips_weight=0.003`, `quant_step=0.50`, `crop_size=384`, `batch_size=32`,
+`lr=1e-5`, and `epochs=80`. The balanced preset uses `batch_size=128` with `crop_size=256`.
 Override any of these on the command line if your GPU memory or target bitrate
 needs a different tradeoff.
+If water ripples or highlights are still too weak, try:
+
+```bash
+--detail-weight 2.0 --rate-weight 0.2 --quant-step 0.45
+```
+
+If you see halo artifacts, false highlights, or white edge fringing, try:
+
+```bash
+--detail-weight 1.0 --rate-weight 0.3 --quant-step 0.55
+```
+
 Checkpoints are saved by optimizer step, not by epoch: with the default
 `--checkpoint-interval-steps 100`, step 100 writes `e1.pt`, step 200 writes
 `e2.pt`, and so on. `latest.pt` is updated at the same save points. For large
 datasets, prefer `--max-steps` over counting full epochs. With 50k images and
-`batch_size=64`, one epoch is about 782 optimizer steps, so `--max-steps 3000`
-is roughly 3.8 epochs.
+`batch_size=32`, one epoch is about 1563 optimizer steps, so `--max-steps 5000`
+is roughly 3.2 epochs.
 
 Export and deploy the high-precision level from the new checkpoint directory:
 

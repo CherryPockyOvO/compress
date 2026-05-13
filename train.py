@@ -40,19 +40,19 @@ TRAIN_PROFILES = {
         "lr": 1e-4,
     },
     "detail": {
-        "lmbda": OFFICIAL_MSE_LAMBDA_Q7,
-        "rate_weight": 1.0,
-        "target_bpp": 1.0,
-        "ssim_weight": 0.40,
-        "detail_weight": 6.0,
-        "l1_weight": 0.50,
-        "lpips_weight": 0.03,
+        "lmbda": 0.05,
+        "rate_weight": 0.25,
+        "target_bpp": None,
+        "ssim_weight": 0.05,
+        "detail_weight": 1.5,
+        "l1_weight": 0.10,
+        "lpips_weight": 0.003,
         "lpips_net": "alex",
-        "quant_step": 0.45,
+        "quant_step": 0.50,
         "epochs": 80,
-        "batch_size": 64,
+        "batch_size": 32,
         "crop_size": 384,
-        "lr": 3e-5,
+        "lr": 1e-5,
     },
 }
 
@@ -61,6 +61,39 @@ TRAIN_PROFILES = {
 class CheckpointState:
     epoch: int
     global_step: int
+
+
+@dataclass
+class RunningBppStats:
+    minimum: float = math.inf
+    maximum: float = -math.inf
+    total: float = 0.0
+    total_sq: float = 0.0
+    count: int = 0
+
+    def update(self, values: torch.Tensor) -> None:
+        values = values.detach().float().reshape(-1)
+        if values.numel() == 0:
+            return
+        self.minimum = min(self.minimum, float(values.min()))
+        self.maximum = max(self.maximum, float(values.max()))
+        self.total += float(values.sum())
+        self.total_sq += float((values * values).sum())
+        self.count += int(values.numel())
+
+    def add_to(self, metrics: dict[str, float], prefix: str = "") -> None:
+        key = lambda name: f"{prefix}{name}" if prefix else name
+        if self.count == 0:
+            metrics[key("bpp_min")] = 0.0
+            metrics[key("bpp_max")] = 0.0
+            metrics[key("bpp_std")] = 0.0
+            return
+
+        mean = self.total / self.count
+        variance = max(0.0, self.total_sq / self.count - mean * mean)
+        metrics[key("bpp_min")] = self.minimum
+        metrics[key("bpp_max")] = self.maximum
+        metrics[key("bpp_std")] = math.sqrt(variance)
 
 
 class ImageFolderDataset(Dataset):
@@ -93,22 +126,95 @@ class Compose:
         return value
 
 
+def resize_to_min_crop(image: Image.Image, size: int) -> Image.Image:
+    width, height = image.size
+    if width >= size and height >= size:
+        return image
+
+    scale = max(size / width, size / height)
+    width = max(size, math.ceil(width * scale))
+    height = max(size, math.ceil(height * scale))
+    resample = getattr(Image, "Resampling", Image).BICUBIC
+    return image.resize((width, height), resample=resample)
+
+
 class RandomCrop:
     def __init__(self, size: int) -> None:
         self.size = int(size)
 
     def __call__(self, image: Image.Image) -> Image.Image:
+        image = resize_to_min_crop(image, self.size)
         width, height = image.size
-        if width < self.size or height < self.size:
-            scale = max(self.size / width, self.size / height)
-            width = max(self.size, math.ceil(width * scale))
-            height = max(self.size, math.ceil(height * scale))
-            resample = getattr(Image, "Resampling", Image).BICUBIC
-            image = image.resize((width, height), resample=resample)
-
         left = random.randint(0, width - self.size)
         top = random.randint(0, height - self.size)
         return image.crop((left, top, left + self.size, top + self.size))
+
+
+class DetailAwareRandomCrop:
+    def __init__(self, size: int, p_detail: float = 0.3) -> None:
+        self.size = int(size)
+        self.p_detail = float(p_detail)
+        self.fallback = RandomCrop(size)
+
+    def __call__(self, image: Image.Image) -> Image.Image:
+        image = resize_to_min_crop(image, self.size)
+        if random.random() >= self.p_detail:
+            return self.fallback(image)
+
+        try:
+            crop = self.detail_crop(image)
+        except (RuntimeError, ValueError):
+            crop = None
+        if crop is None:
+            return self.fallback(image)
+        return crop
+
+    def detail_crop(self, image: Image.Image) -> Image.Image | None:
+        width, height = image.size
+        score = self.score_map(image)
+        if score is None or score.numel() == 0:
+            return None
+
+        flat_score = score.flatten()
+        if float(flat_score.max()) <= 1e-4:
+            return None
+
+        index = int(torch.multinomial(flat_score.clamp_min(0.0), num_samples=1).item())
+        score_height, score_width = score.shape
+        center_y = (index // score_width + 0.5) * height / score_height
+        center_x = (index % score_width + 0.5) * width / score_width
+
+        left = round(center_x - self.size / 2)
+        top = round(center_y - self.size / 2)
+        left = min(max(0, left), width - self.size)
+        top = min(max(0, top), height - self.size)
+        return image.crop((left, top, left + self.size, top + self.size))
+
+    @staticmethod
+    def score_map(image: Image.Image) -> torch.Tensor | None:
+        width, height = image.size
+        max_side = max(width, height)
+        if max_side > 256:
+            scale = 256 / max_side
+            score_size = (max(1, round(width * scale)), max(1, round(height * scale)))
+            resample = getattr(Image, "Resampling", Image).BILINEAR
+            image = image.resize(score_size, resample=resample)
+            width, height = image.size
+
+        gray_image = ImageOps.grayscale(image)
+        gray = torch.frombuffer(bytearray(gray_image.tobytes()), dtype=torch.uint8)
+        gray = gray.to(torch.float32).view(height, width) / 255.0
+        if height < 3 or width < 3:
+            return None
+
+        kernel = gray.new_tensor([[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]])
+        laplacian = F.conv2d(
+            gray.view(1, 1, height, width),
+            kernel.view(1, 1, 3, 3),
+            padding=1,
+        ).abs()
+        score = laplacian.squeeze(0).squeeze(0) + 2.0 * torch.relu(gray - 0.7)
+        return score
 
 
 class CenterCrop:
@@ -116,14 +222,8 @@ class CenterCrop:
         self.size = int(size)
 
     def __call__(self, image: Image.Image) -> Image.Image:
+        image = resize_to_min_crop(image, self.size)
         width, height = image.size
-        if width < self.size or height < self.size:
-            scale = max(self.size / width, self.size / height)
-            width = max(self.size, math.ceil(width * scale))
-            height = max(self.size, math.ceil(height * scale))
-            resample = getattr(Image, "Resampling", Image).BICUBIC
-            image = image.resize((width, height), resample=resample)
-
         left = (width - self.size) // 2
         top = (height - self.size) // 2
         return image.crop((left, top, left + self.size, top + self.size))
@@ -147,10 +247,16 @@ class ToTensor:
         return values / 255.0
 
 
-def make_train_transform(crop_size: int) -> Compose:
+def make_train_transform(crop_size: int, quality_profile: str = "balanced") -> Compose:
+    crop: Callable[[Image.Image], Image.Image]
+    if quality_profile == "detail":
+        crop = DetailAwareRandomCrop(crop_size, p_detail=0.3)
+    else:
+        crop = RandomCrop(crop_size)
+
     return Compose(
         [
-            RandomCrop(crop_size),
+            crop,
             RandomHorizontalFlip(p=0.5),
             ToTensor(),
         ]
@@ -171,6 +277,17 @@ def compute_bpp(likelihoods: dict[str, torch.Tensor], num_pixels: int) -> torch.
     for likelihood in likelihoods.values():
         bits = bits + torch.sum(-torch.log2(likelihood.clamp_min(1e-9)))
     return bits / float(num_pixels)
+
+
+def compute_bpp_per_image(
+    likelihoods: dict[str, torch.Tensor],
+    num_pixels_per_image: int,
+) -> torch.Tensor:
+    first_likelihood = next(iter(likelihoods.values()))
+    bits = torch.zeros(first_likelihood.size(0), device=first_likelihood.device)
+    for likelihood in likelihoods.values():
+        bits = bits + torch.sum(-torch.log2(likelihood.clamp_min(1e-9)).flatten(1), dim=1)
+    return bits / float(num_pixels_per_image)
 
 
 def ssim_index(x: torch.Tensor, y: torch.Tensor, window_size: int = 11) -> torch.Tensor:
@@ -201,6 +318,47 @@ def ssim_index(x: torch.Tensor, y: torch.Tensor, window_size: int = 11) -> torch
     return score.mean()
 
 
+def rgb_to_y(x: torch.Tensor) -> torch.Tensor:
+    return 0.299 * x[:, 0:1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3]
+
+
+def laplacian_map(x: torch.Tensor) -> torch.Tensor:
+    channels = x.size(1)
+    kernel = x.new_tensor([[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]])
+    kernel = kernel.view(1, 1, 3, 3).expand(channels, 1, 3, 3)
+    return F.conv2d(x, kernel, padding=1, groups=channels)
+
+
+def make_highlight_texture_weight(target: torch.Tensor) -> torch.Tensor:
+    with torch.no_grad():
+        target = target.detach()
+        y = rgb_to_y(target)
+        bright = torch.sigmoid((y - 0.72) / 0.08)
+        lap = torch.abs(laplacian_map(y))
+        lap = lap / (lap.mean(dim=(2, 3), keepdim=True) + 1e-6)
+        weight = 1.0 + 2.5 * bright + 1.5 * lap.clamp(0.0, 3.0)
+        return weight.clamp(1.0, 6.0)
+
+
+def highlight_texture_loss(x_hat: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    weight = make_highlight_texture_weight(target)
+    l1 = (weight * torch.abs(x_hat - target)).mean()
+
+    lap_x = laplacian_map(x_hat)
+    lap_t = laplacian_map(target)
+    lap_loss = (weight * torch.abs(lap_x - lap_t)).mean()
+
+    y_hat = rgb_to_y(x_hat)
+    y_tgt = rgb_to_y(target)
+    mu_hat = F.avg_pool2d(y_hat, kernel_size=7, stride=1, padding=3)
+    mu_tgt = F.avg_pool2d(y_tgt, kernel_size=7, stride=1, padding=3)
+    std_hat = torch.sqrt(F.avg_pool2d((y_hat - mu_hat) ** 2, 7, 1, 3) + 1e-6)
+    std_tgt = torch.sqrt(F.avg_pool2d((y_tgt - mu_tgt) ** 2, 7, 1, 3) + 1e-6)
+    contrast_loss = (weight * torch.abs(std_hat - std_tgt)).mean()
+
+    return l1 + 0.8 * lap_loss + 0.3 * contrast_loss
+
+
 def gradient_detail_loss(x_hat: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     channels = x_hat.size(1)
     kernel_x = x_hat.new_tensor(
@@ -221,6 +379,10 @@ def gradient_detail_loss(x_hat: torch.Tensor, target: torch.Tensor) -> torch.Ten
         torch.sqrt((pred_gx - target_gx).pow(2) + eps * eps).mean()
         + torch.sqrt((pred_gy - target_gy).pow(2) + eps * eps).mean()
     )
+
+
+def detail_reconstruction_loss(x_hat: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    return highlight_texture_loss(x_hat, target) + 0.2 * gradient_detail_loss(x_hat, target)
 
 
 def make_lpips_model(net: str) -> nn.Module:
@@ -269,8 +431,9 @@ class RateDistortionLoss(nn.Module):
     def forward(self, output: dict[str, Any], target: torch.Tensor) -> dict[str, torch.Tensor]:
         x_hat = output["x_hat"]
         mse = F.mse_loss(x_hat, target)
-        num_pixels = target.size(0) * target.size(2) * target.size(3)
-        bpp = compute_bpp(output["likelihoods"], num_pixels)
+        num_pixels_per_image = target.size(2) * target.size(3)
+        bpp_per_image = compute_bpp_per_image(output["likelihoods"], num_pixels_per_image)
+        bpp = bpp_per_image.mean()
         if self.target_bpp is None:
             rate_loss = bpp
         else:
@@ -280,7 +443,7 @@ class RateDistortionLoss(nn.Module):
         ssim_loss = 1.0 - ssim
         l1_loss = F.l1_loss(x_hat, target)
         if self.detail_weight > 0:
-            detail_loss = gradient_detail_loss(x_hat, target)
+            detail_loss = detail_reconstruction_loss(x_hat, target)
         else:
             detail_loss = mse.new_zeros(())
         if self.lpips_model is not None:
@@ -307,6 +470,7 @@ class RateDistortionLoss(nn.Module):
             "loss": loss,
             "mse": mse,
             "bpp": bpp,
+            "bpp_per_image": bpp_per_image,
             "rate_loss": rate_loss,
             "ssim": ssim,
             "ssim_loss": ssim_loss,
@@ -433,6 +597,14 @@ def format_detail_metrics(
         f"grad={metrics[key('detail_loss')]:.5f}",
         f"l1={metrics[key('l1_loss')]:.5f}",
     ]
+    if all(key(name) in metrics for name in ("bpp_min", "bpp_max", "bpp_std")):
+        parts.extend(
+            [
+                f"bpp_min={metrics[key('bpp_min')]:.3f}",
+                f"bpp_max={metrics[key('bpp_max')]:.3f}",
+                f"bpp_std={metrics[key('bpp_std')]:.3f}",
+            ]
+        )
     if include_lpips or metrics.get(key("lpips_loss"), 0.0) > 0.0:
         parts.append(f"lpips={metrics[key('lpips_loss')]:.5f}")
     skipped_key = key("skipped_batches")
@@ -563,6 +735,8 @@ def train_one_epoch(
         "lpips_loss": 0.0,
     }
     interval_totals = {key: 0.0 for key in totals}
+    bpp_stats = RunningBppStats()
+    interval_bpp_stats = RunningBppStats()
     processed_samples = 0
     interval_samples = 0
     skipped_batches = 0
@@ -620,6 +794,9 @@ def train_one_epoch(
             value = float(losses[key].detach()) * batch_size
             totals[key] += value
             interval_totals[key] += value
+        bpp_values = losses.get("bpp_per_image", losses["bpp"]).detach()
+        bpp_stats.update(bpp_values)
+        interval_bpp_stats.update(bpp_values)
 
         progress.set_postfix(
             step=global_step,
@@ -639,11 +816,13 @@ def train_one_epoch(
                 key: value / interval_count for key, value in interval_totals.items()
             }
             interval_metrics["skipped_batches"] = float(interval_skipped_batches)
+            interval_bpp_stats.add_to(interval_metrics)
             if not on_checkpoint(epoch, global_step, interval_metrics):
                 stop_training = True
                 break
             model.train()
             interval_totals = {key: 0.0 for key in totals}
+            interval_bpp_stats = RunningBppStats()
             interval_samples = 0
             interval_skipped_batches = 0
 
@@ -654,6 +833,7 @@ def train_one_epoch(
     count = max(1, processed_samples)
     metrics = {key: value / count for key, value in totals.items()}
     metrics["skipped_batches"] = float(skipped_batches)
+    bpp_stats.add_to(metrics)
     return metrics, global_step, stop_training
 
 
@@ -676,6 +856,7 @@ def evaluate_loss(
         "l1_loss": 0.0,
         "lpips_loss": 0.0,
     }
+    bpp_stats = RunningBppStats()
     processed_samples = 0
     skipped_batches = 0
 
@@ -699,6 +880,7 @@ def evaluate_loss(
         processed_samples += batch_size
         for key in totals:
             totals[key] += float(losses[key].detach()) * batch_size
+        bpp_stats.update(losses.get("bpp_per_image", losses["bpp"]).detach())
         progress.set_postfix(
             loss=f"{float(losses['loss'].detach()):.4f}",
             bpp=f"{float(losses['bpp'].detach()):.3f}",
@@ -707,6 +889,7 @@ def evaluate_loss(
     count = max(1, processed_samples)
     metrics = {f"val_{key}": value / count for key, value in totals.items()}
     metrics["val_skipped_batches"] = float(skipped_batches)
+    bpp_stats.add_to(metrics, prefix="val_")
     return metrics
 
 
@@ -716,7 +899,7 @@ def parse_args() -> argparse.Namespace:
         "--quality-profile",
         choices=tuple(TRAIN_PROFILES.keys()),
         default="balanced",
-        help="Training preset. detail is the high-precision fine-tuning preset for hair, lines, and texture.",
+        help="Training preset. detail is the high-precision preset for bright highlights, lines, and texture.",
     )
     parser.add_argument("--train-dir", type=Path, required=True)
     parser.add_argument("--val-dir", type=Path, default=None)
@@ -738,7 +921,7 @@ def parse_args() -> argparse.Namespace:
         "--detail-weight",
         type=float,
         default=None,
-        help="Weight for Sobel gradient detail loss. Use >0 to preserve lines and fine texture.",
+        help="Weight for highlight-aware detail reconstruction loss. Use >0 to preserve bright fine texture.",
     )
     parser.add_argument(
         "--l1-weight",
@@ -750,7 +933,7 @@ def parse_args() -> argparse.Namespace:
         "--lpips-weight",
         type=float,
         default=None,
-        help="Optional LPIPS perceptual loss weight. Start around 0.03 for detail fine-tuning.",
+        help="Optional LPIPS perceptual loss weight. Start around 0.003 for detail fine-tuning.",
     )
     parser.add_argument(
         "--lpips-net",
@@ -869,7 +1052,7 @@ def main() -> None:
     else:
         print("device: cpu")
 
-    transform = make_train_transform(args.crop_size)
+    transform = make_train_transform(args.crop_size, args.quality_profile)
     train_dataset = ImageFolderDataset(args.train_dir, transform=transform)
     train_loader = DataLoader(
         train_dataset,
