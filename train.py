@@ -30,6 +30,7 @@ TRAIN_PROFILES = {
         "target_bpp": None,
         "ssim_weight": 0.2,
         "detail_weight": 0.0,
+        "highlight_weight": 0.0,
         "l1_weight": 0.0,
         "lpips_weight": 0.0,
         "lpips_net": "alex",
@@ -45,6 +46,7 @@ TRAIN_PROFILES = {
         "target_bpp": None,
         "ssim_weight": 0.05,
         "detail_weight": 1.5,
+        "highlight_weight": 1.0,
         "l1_weight": 0.10,
         "lpips_weight": 0.003,
         "lpips_net": "alex",
@@ -318,8 +320,12 @@ def ssim_index(x: torch.Tensor, y: torch.Tensor, window_size: int = 11) -> torch
     return score.mean()
 
 
-def rgb_to_y(x: torch.Tensor) -> torch.Tensor:
+def rgb_to_luma(x: torch.Tensor) -> torch.Tensor:
     return 0.299 * x[:, 0:1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3]
+
+
+def rgb_to_y(x: torch.Tensor) -> torch.Tensor:
+    return rgb_to_luma(x)
 
 
 def laplacian_map(x: torch.Tensor) -> torch.Tensor:
@@ -332,12 +338,47 @@ def laplacian_map(x: torch.Tensor) -> torch.Tensor:
 def make_highlight_texture_weight(target: torch.Tensor) -> torch.Tensor:
     with torch.no_grad():
         target = target.detach()
-        y = rgb_to_y(target)
+        y = rgb_to_luma(target)
         bright = torch.sigmoid((y - 0.72) / 0.08)
         lap = torch.abs(laplacian_map(y))
         lap = lap / (lap.mean(dim=(2, 3), keepdim=True) + 1e-6)
         weight = 1.0 + 2.5 * bright + 1.5 * lap.clamp(0.0, 3.0)
         return weight.clamp(1.0, 6.0)
+
+
+def make_highlight_focus_weight(
+    target: torch.Tensor,
+    threshold: float = 0.72,
+    softness: float = 0.08,
+    peak_threshold: float = 0.88,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    with torch.no_grad():
+        luma = rgb_to_luma(target.detach())
+        bright = torch.sigmoid((luma - threshold) / softness)
+        peak = torch.sigmoid((luma - peak_threshold) / max(softness * 0.5, 1e-6))
+        lap = torch.abs(laplacian_map(luma))
+        lap = lap / (lap.mean(dim=(2, 3), keepdim=True) + 1e-6)
+        edge = lap.clamp(0.0, 4.0)
+
+        focus = bright * (1.0 + 1.5 * edge) + 1.5 * peak
+        return focus.clamp(0.0, 8.0), peak.clamp(0.0, 1.0)
+
+
+def highlight_aware_loss(x_hat: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    focus_weight, peak_weight = make_highlight_focus_weight(target)
+
+    rgb_l1 = (focus_weight * torch.abs(x_hat - target)).mean()
+
+    y_hat = rgb_to_luma(x_hat)
+    y_tgt = rgb_to_luma(target)
+    luma_l1 = (focus_weight * torch.abs(y_hat - y_tgt)).mean()
+
+    lap_hat = laplacian_map(y_hat)
+    lap_tgt = laplacian_map(y_tgt)
+    lap_loss = (focus_weight * torch.abs(lap_hat - lap_tgt)).mean()
+
+    under_loss = (peak_weight * torch.relu(y_tgt - y_hat)).mean()
+    return rgb_l1 + 0.75 * luma_l1 + 0.5 * lap_loss + 0.5 * under_loss
 
 
 def highlight_texture_loss(x_hat: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -348,8 +389,8 @@ def highlight_texture_loss(x_hat: torch.Tensor, target: torch.Tensor) -> torch.T
     lap_t = laplacian_map(target)
     lap_loss = (weight * torch.abs(lap_x - lap_t)).mean()
 
-    y_hat = rgb_to_y(x_hat)
-    y_tgt = rgb_to_y(target)
+    y_hat = rgb_to_luma(x_hat)
+    y_tgt = rgb_to_luma(target)
     mu_hat = F.avg_pool2d(y_hat, kernel_size=7, stride=1, padding=3)
     mu_tgt = F.avg_pool2d(y_tgt, kernel_size=7, stride=1, padding=3)
     std_hat = torch.sqrt(F.avg_pool2d((y_hat - mu_hat) ** 2, 7, 1, 3) + 1e-6)
@@ -413,6 +454,7 @@ class RateDistortionLoss(nn.Module):
         target_bpp: float | None = None,
         ssim_weight: float = 0.2,
         detail_weight: float = 0.0,
+        highlight_weight: float = 0.0,
         l1_weight: float = 0.0,
         lpips_weight: float = 0.0,
         lpips_net: str = "alex",
@@ -423,6 +465,7 @@ class RateDistortionLoss(nn.Module):
         self.target_bpp = None if target_bpp is None else float(target_bpp)
         self.ssim_weight = float(ssim_weight)
         self.detail_weight = float(detail_weight)
+        self.highlight_weight = float(highlight_weight)
         self.l1_weight = float(l1_weight)
         self.lpips_weight = float(lpips_weight)
         self.lpips_net = lpips_net
@@ -446,6 +489,10 @@ class RateDistortionLoss(nn.Module):
             detail_loss = detail_reconstruction_loss(x_hat, target)
         else:
             detail_loss = mse.new_zeros(())
+        if self.highlight_weight > 0:
+            highlight_loss = highlight_aware_loss(x_hat, target)
+        else:
+            highlight_loss = mse.new_zeros(())
         if self.lpips_model is not None:
             if x_hat.device.type == "cuda":
                 lpips_context = torch.amp.autocast("cuda", enabled=False)
@@ -463,6 +510,7 @@ class RateDistortionLoss(nn.Module):
             + self.rate_weight * rate_loss
             + self.ssim_weight * ssim_loss
             + self.detail_weight * detail_loss
+            + self.highlight_weight * highlight_loss
             + self.l1_weight * l1_loss
             + self.lpips_weight * lpips_loss
         )
@@ -475,6 +523,7 @@ class RateDistortionLoss(nn.Module):
             "ssim": ssim,
             "ssim_loss": ssim_loss,
             "detail_loss": detail_loss,
+            "highlight_loss": highlight_loss,
             "l1_loss": l1_loss,
             "lpips_loss": lpips_loss,
         }
@@ -529,6 +578,7 @@ def save_checkpoint(
         "target_bpp": args.target_bpp,
         "ssim_weight": args.ssim_weight,
         "detail_weight": args.detail_weight,
+        "highlight_weight": args.highlight_weight,
         "l1_weight": args.l1_weight,
         "lpips_weight": args.lpips_weight,
         "lpips_net": args.lpips_net,
@@ -595,6 +645,7 @@ def format_detail_metrics(
     parts = [
         f"rate={metrics[key('rate_loss')]:.4f}",
         f"grad={metrics[key('detail_loss')]:.5f}",
+        f"hi={metrics[key('highlight_loss')]:.5f}",
         f"l1={metrics[key('l1_loss')]:.5f}",
     ]
     if all(key(name) in metrics for name in ("bpp_min", "bpp_max", "bpp_std")):
@@ -675,7 +726,8 @@ def print_run_config(
         f"  objective: profile={args.quality_profile} lambda={args.lmbda:g} "
         f"target_bpp={args.target_bpp} rate={args.rate_weight:g} "
         f"ssim={args.ssim_weight:g} grad={args.detail_weight:g} "
-        f"l1={args.l1_weight:g} lpips={lpips_text} quant_step={quant_step:g}"
+        f"highlight={args.highlight_weight:g} l1={args.l1_weight:g} "
+        f"lpips={lpips_text} quant_step={quant_step:g}"
     )
     print(
         f"  schedule: epochs={args.epochs} max_steps={args.max_steps} "
@@ -731,6 +783,7 @@ def train_one_epoch(
         "rate_loss": 0.0,
         "ssim": 0.0,
         "detail_loss": 0.0,
+        "highlight_loss": 0.0,
         "l1_loss": 0.0,
         "lpips_loss": 0.0,
     }
@@ -853,6 +906,7 @@ def evaluate_loss(
         "rate_loss": 0.0,
         "ssim": 0.0,
         "detail_loss": 0.0,
+        "highlight_loss": 0.0,
         "l1_loss": 0.0,
         "lpips_loss": 0.0,
     }
@@ -921,7 +975,16 @@ def parse_args() -> argparse.Namespace:
         "--detail-weight",
         type=float,
         default=None,
-        help="Weight for highlight-aware detail reconstruction loss. Use >0 to preserve bright fine texture.",
+        help="Weight for high-frequency detail reconstruction loss.",
+    )
+    parser.add_argument(
+        "--highlight-weight",
+        type=float,
+        default=None,
+        help=(
+            "Weight for the explicit highlight-aware loss. Use >0 to focus "
+            "fine-tuning on bright edges, reflections, and specular texture."
+        ),
     )
     parser.add_argument(
         "--l1-weight",
@@ -1029,6 +1092,8 @@ def apply_quality_profile(args: argparse.Namespace) -> None:
         raise ValueError("--target-bpp must be non-negative")
     if args.detail_weight < 0:
         raise ValueError("--detail-weight must be non-negative")
+    if args.highlight_weight < 0:
+        raise ValueError("--highlight-weight must be non-negative")
     if args.l1_weight < 0:
         raise ValueError("--l1-weight must be non-negative")
     if args.lpips_weight < 0:
@@ -1089,6 +1154,7 @@ def main() -> None:
         target_bpp=args.target_bpp,
         ssim_weight=args.ssim_weight,
         detail_weight=args.detail_weight,
+        highlight_weight=args.highlight_weight,
         l1_weight=args.l1_weight,
         lpips_weight=args.lpips_weight,
         lpips_net=args.lpips_net,

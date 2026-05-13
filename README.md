@@ -141,11 +141,12 @@ Use this when you already have a trained `.pt` at the current quality level and
 want a second, higher-bpp level with better water highlights, thin bright lines,
 and local texture retention.
 The preset keeps the same model tensor shapes, so old compatible checkpoints can
-be used as the starting point. The `detail` objective is now highlight-aware,
-high-frequency-aware, and local-contrast-aware: it upweights bright high-frequency
-regions, matches Laplacian texture, and preserves local luminance contrast. The
-training cropper also samples a minority of patches near bright or high-frequency
-regions while keeping ordinary random crops as the default behavior.
+be used as the starting point. The `detail` objective combines high-frequency
+detail reconstruction with an explicit highlight-aware loss: it upweights bright
+edges, specular peaks, reflections, water ripples, and local luminance contrast.
+The training cropper also samples a minority of patches near bright or
+high-frequency regions while keeping ordinary random crops as the default
+behavior.
 
 ```bash
 python train.py \
@@ -159,21 +160,22 @@ python train.py \
 ```
 
 The `detail` preset expands to `lambda=0.05`, `target_bpp=None`,
-`rate_weight=0.25`, `ssim_weight=0.05`, `detail_weight=1.5`, `l1_weight=0.10`,
-`lpips_weight=0.003`, `quant_step=0.50`, `crop_size=384`, `batch_size=32`,
-`lr=1e-5`, and `epochs=80`. The balanced preset uses `batch_size=128` with `crop_size=256`.
+`rate_weight=0.25`, `ssim_weight=0.05`, `detail_weight=1.5`,
+`highlight_weight=1.0`, `l1_weight=0.10`, `lpips_weight=0.003`,
+`quant_step=0.50`, `crop_size=384`, `batch_size=32`, `lr=1e-5`, and
+`epochs=80`. The balanced preset uses `batch_size=128` with `crop_size=256`.
 Override any of these on the command line if your GPU memory or target bitrate
 needs a different tradeoff.
 If water ripples or highlights are still too weak, try:
 
 ```bash
---detail-weight 2.0 --rate-weight 0.2 --quant-step 0.45
+--highlight-weight 1.5 --detail-weight 2.0 --rate-weight 0.2 --quant-step 0.45
 ```
 
 If you see halo artifacts, false highlights, or white edge fringing, try:
 
 ```bash
---detail-weight 1.0 --rate-weight 0.3 --quant-step 0.55
+--highlight-weight 0.5 --detail-weight 1.0 --rate-weight 0.3 --quant-step 0.55
 ```
 
 Checkpoints are saved by optimizer step, not by epoch: with the default
