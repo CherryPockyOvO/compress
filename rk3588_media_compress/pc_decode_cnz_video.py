@@ -195,8 +195,11 @@ def setup_model(
         device = torch.device(args.device)
 
     if device.type == "cuda":
-        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.benchmark = args.cudnn_benchmark
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
         print(f"device: cuda ({torch.cuda.get_device_name(device)})")
+        print(f"cudnn_benchmark: {torch.backends.cudnn.benchmark}")
     else:
         print("device: cpu")
 
@@ -335,6 +338,7 @@ def tensor_batch_to_uint8_nhwc(torch_module: Any, tensor: Any) -> Any:
 
 def decode_cnz_batch(
     batch_items: Sequence[Tuple[int, Path]],
+    real_count: int,
     output_start_index: int,
     args: argparse.Namespace,
     model: Any,
@@ -389,9 +393,13 @@ def decode_cnz_batch(
 
     save_t0 = cnz_decoder.now_synced(device)
     batch_records: List[Dict[str, Any]] = []
+    real_cropped = cropped[:real_count]
+    real_original_sizes = original_sizes[:real_count]
+    real_batch_items = batch_items[:real_count]
+
     if args.pipe_video:
         height, width = original_sizes[0]
-        if any(size != (height, width) for size in original_sizes):
+        if any(size != (height, width) for size in real_original_sizes):
             raise ValueError("--pipe-video requires all frames in a batch to have the same output size")
         if expected_video_size is None:
             expected_video_size = (height, width)
@@ -407,11 +415,11 @@ def decode_cnz_batch(
             )
         if ffmpeg_proc.stdin is None:
             raise RuntimeError("ffmpeg stdin is unavailable")
-        for tensor in cropped:
+        for tensor in real_cropped:
             rgb = tensor_batch_to_uint8_nhwc(torch, tensor)
             ffmpeg_proc.stdin.write(rgb.numpy().tobytes())
     else:
-        for i, tensor in enumerate(cropped):
+        for i, tensor in enumerate(real_cropped):
             image_path = args.decoded_dir / f"frame_{output_start_index + i:08d}.{args.image_format}"
             cnz_decoder.tensor_to_image(tensor, image_path)
     save_t1 = cnz_decoder.now_synced(device)
@@ -424,9 +432,11 @@ def decode_cnz_batch(
         "crop_sec": crop_t1 - crop_t0,
         "save_or_pipe_sec": save_t1 - save_t0,
     }
-    per_frame_total = total_sec / len(batch_items)
+    per_frame_total = total_sec / real_count
 
-    for i, ((source_index, cnz_path), original_size) in enumerate(zip(batch_items, original_sizes)):
+    for i, ((source_index, cnz_path), original_size) in enumerate(
+        zip(real_batch_items, real_original_sizes)
+    ):
         image_path = None
         if not args.pipe_video:
             image_path = args.decoded_dir / f"frame_{output_start_index + i:08d}.{args.image_format}"
@@ -440,15 +450,18 @@ def decode_cnz_batch(
                 "width": int(original_size[1]),
                 "decode_sec": round(per_frame_total, 4),
                 "decode_fps": round(1.0 / per_frame_total, 4) if per_frame_total > 0 else 0.0,
-                "batch_size": len(batch_items),
+                "batch_size": real_count,
+                "decode_batch_size": len(batch_items),
                 "batch_decode_sec": round(total_sec, 4),
-                "cnz_unpack_sec": round(timings["cnz_unpack_sec"] / len(batch_items), 4),
-                "torch_decoder_sec": round(timings["torch_decoder_sec"] / len(batch_items), 4),
-                "crop_sec": round(timings["crop_sec"] / len(batch_items), 4),
-                "save_or_pipe_sec": round(timings["save_or_pipe_sec"] / len(batch_items), 4),
+                "cnz_unpack_sec": round(timings["cnz_unpack_sec"] / real_count, 4),
+                "torch_decoder_sec": round(timings["torch_decoder_sec"] / real_count, 4),
+                "crop_sec": round(timings["crop_sec"] / real_count, 4),
+                "save_or_pipe_sec": round(timings["save_or_pipe_sec"] / real_count, 4),
             }
         )
 
+    timings["real_batch_size"] = float(real_count)
+    timings["decode_batch_size"] = float(len(batch_items))
     return batch_records, ffmpeg_proc, expected_video_size, timings
 
 
@@ -514,6 +527,12 @@ def parse_args() -> argparse.Namespace:
         help="Decode this many CNZ frames per PyTorch decoder call. Use 1 for mixed shapes.",
     )
     parser.add_argument(
+        "--pad-last-batch",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Pad the final partial batch to --batch-size to avoid slow one-off CUDA shapes.",
+    )
+    parser.add_argument(
         "--pipe-video",
         action="store_true",
         help="Do not write intermediate PNG/JPG frames; pipe decoded RGB frames directly to ffmpeg.",
@@ -527,6 +546,12 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Use channels-last memory format on CUDA.",
+    )
+    parser.add_argument(
+        "--cudnn-benchmark",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable cuDNN autotune. Use --no-cudnn-benchmark for short clips if first batch is slow.",
     )
     parser.add_argument(
         "--compile",
@@ -649,8 +674,19 @@ def main() -> None:
             )
             output_index += 1
         else:
+            real_count = len(batch_items)
+            decode_items = batch_items
+            if (
+                args.pad_last_batch
+                and args.batch_size > 1
+                and real_count < args.batch_size
+                and len(cnz_files) >= args.batch_size
+            ):
+                decode_items = list(batch_items)
+                decode_items.extend([batch_items[-1]] * (args.batch_size - real_count))
             records, ffmpeg_proc, expected_video_size, timings = decode_cnz_batch(
-                batch_items,
+                decode_items,
+                real_count,
                 output_index,
                 args,
                 model,
@@ -666,9 +702,15 @@ def main() -> None:
             batch_fps = batch_count / timings["decode_sec"] if timings["decode_sec"] > 0 else 0.0
             first = records[0]["output_index"]
             last = records[-1]["output_index"]
+            decode_batch_size = int(timings["decode_batch_size"])
+            batch_note = (
+                f" batch={batch_count}"
+                if decode_batch_size == batch_count
+                else f" batch={batch_count} padded={decode_batch_size}"
+            )
             print(
                 f"[{output_index}/{len(cnz_files)}] frames {first:08d}-{last:08d} "
-                f"batch={batch_count} decode={timings['decode_sec']:.3f}s "
+                f"{batch_note} decode={timings['decode_sec']:.3f}s "
                 f"unpack={timings['cnz_unpack_sec']:.3f}s "
                 f"torch={timings['torch_decoder_sec']:.3f}s "
                 f"save_pipe={timings['save_or_pipe_sec']:.3f}s "

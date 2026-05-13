@@ -177,14 +177,20 @@ python3 rk3588_media_compress/pc_decode_cnz_video.py \
   --fps 30 \
   --device cuda \
   --half \
-  --batch-size 8 \
+  --batch-size 4 \
   --pipe-video \
   --overwrite
 ```
 
-`--batch-size 8` sends eight latent frames through the PyTorch decoder at once.
+`--batch-size 4` sends four latent frames through the PyTorch decoder at once.
 `--pipe-video` skips intermediate PNG/JPG files and streams RGB frames directly
 to `ffmpeg`, which is much faster when you only need the final video.
+
+For short clips, if the first CUDA batch is much slower than later batches, try:
+
+```bash
+--no-cudnn-benchmark
+```
 
 Delete decoded PNG frames after the video is written:
 
