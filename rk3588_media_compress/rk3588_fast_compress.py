@@ -25,12 +25,13 @@ def now_iso() -> str:
     return _dt.datetime.now(_dt.timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
-def run_command(cmd: Sequence[str]) -> None:
+def run_command(cmd: Sequence[str], timeout: Optional[float] = None) -> None:
     proc = subprocess.run(
         list(cmd),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        timeout=timeout,
     )
     if proc.returncode != 0:
         rendered = " ".join(str(part) for part in cmd)
@@ -128,11 +129,105 @@ def resolve_core_mask(rknn_lite: Any, name: str) -> int:
     raise ValueError(f"RKNNLite on this board does not expose {attr}")
 
 
+def run_entropy_command(
+    bin_path: Path,
+    meta_path: Path,
+    cnz_path: Path,
+    config: Dict[str, Any],
+) -> None:
+    run_command(
+        [
+            str(config["cnz_encode_cli"]),
+            "--latent",
+            str(bin_path),
+            "--params",
+            str(config["params"]),
+            "--output",
+            str(cnz_path),
+            "--metadata",
+            str(meta_path),
+            "--codec",
+            str(config["codec"]),
+            "--zlib-level",
+            str(config["zlib_level"]),
+        ],
+        timeout=float(config["entropy_timeout"]),
+    )
+
+
+def entropy_worker(
+    entropy_worker_id: int,
+    entropy_queue: mp.Queue,
+    result_queue: mp.Queue,
+    config: Dict[str, Any],
+) -> None:
+    try:
+        while True:
+            job = entropy_queue.get()
+            if job is None:
+                break
+
+            bin_path = Path(job["bin_path"])
+            meta_path = Path(job["meta_path"])
+            cnz_path = Path(job["cnz_path"])
+            entropy_wait_sec = time.perf_counter() - float(job["queued_for_entropy_at"])
+            entropy_t0 = time.perf_counter()
+            try:
+                run_entropy_command(
+                    bin_path=bin_path,
+                    meta_path=meta_path,
+                    cnz_path=cnz_path,
+                    config=config,
+                )
+                entropy_sec = time.perf_counter() - entropy_t0
+
+                if not config["keep_bin"]:
+                    bin_path.unlink(missing_ok=True)
+                if not config["keep_latent_metadata"]:
+                    meta_path.unlink(missing_ok=True)
+
+                total_sec = time.perf_counter() - float(job["total_t0"])
+                result_queue.put(
+                    {
+                        "type": "frame",
+                        "index": int(job["index"]),
+                        "source": str(job["source"]),
+                        "cnz": str(job["cnz_rel"]),
+                        "core_mask": str(job["core_mask"]),
+                        "worker_id": int(job["worker_id"]),
+                        "entropy_worker_id": entropy_worker_id,
+                        "bytes": cnz_path.stat().st_size,
+                        "elapsed_sec": round(total_sec, 4),
+                        "preprocess_sec": round(float(job["preprocess_sec"]), 4),
+                        "npu_inference_sec": round(float(job["npu_inference_sec"]), 4),
+                        "save_bin_sec": round(float(job["save_bin_sec"]), 4),
+                        "entropy_wait_sec": round(entropy_wait_sec, 4),
+                        "entropy_sec": round(entropy_sec, 4),
+                        "frame_fps": round(1.0 / total_sec, 4) if total_sec > 0 else 0.0,
+                    }
+                )
+            except Exception as exc:
+                result_queue.put(
+                    {
+                        "type": "error",
+                        "index": int(job.get("index", -1)),
+                        "worker_id": int(job.get("worker_id", -1)),
+                        "core_mask": str(job.get("core_mask", "")),
+                        "entropy_worker_id": entropy_worker_id,
+                        "error": f"entropy worker failed: {exc}",
+                    }
+                )
+    finally:
+        result_queue.put({"type": "entropy_stopped", "entropy_worker_id": entropy_worker_id})
+
+
 def encode_worker(
     worker_id: int,
     core_mask_name: str,
     task_queue: mp.Queue,
     result_queue: mp.Queue,
+    entropy_queue: Optional[mp.Queue],
+    entropy_semaphore: mp.Semaphore,
     config: Dict[str, Any],
 ) -> None:
     import numpy as np
@@ -214,49 +309,77 @@ def encode_worker(
                 )
                 save_sec = time.perf_counter() - save_t0
 
-                entropy_t0 = time.perf_counter()
-                run_command(
-                    [
-                        str(config["cnz_encode_cli"]),
-                        "--latent",
-                        str(bin_path),
-                        "--params",
-                        str(config["params"]),
-                        "--output",
-                        str(cnz_path),
-                        "--metadata",
-                        str(meta_path),
-                        "--codec",
-                        str(config["codec"]),
-                        "--zlib-level",
-                        str(config["zlib_level"]),
-                    ]
-                )
-                entropy_sec = time.perf_counter() - entropy_t0
+                if config["separate_entropy"]:
+                    if entropy_queue is None:
+                        raise RuntimeError("separate entropy is enabled but entropy_queue is missing")
+                    entropy_queue.put(
+                        {
+                            "index": index,
+                            "source": str(frame_path),
+                            "bin_path": str(bin_path),
+                            "meta_path": str(meta_path),
+                            "cnz_path": str(cnz_path),
+                            "cnz_rel": str(cnz_path.relative_to(config["output"])),
+                            "core_mask": core_mask_name,
+                            "worker_id": worker_id,
+                            "total_t0": total_t0,
+                            "preprocess_sec": pre_sec,
+                            "npu_inference_sec": npu_sec,
+                            "save_bin_sec": save_sec,
+                            "queued_for_entropy_at": time.perf_counter(),
+                        }
+                    )
+                    result_queue.put(
+                        {
+                            "type": "npu_frame",
+                            "index": index,
+                            "core_mask": core_mask_name,
+                            "worker_id": worker_id,
+                            "preprocess_sec": round(pre_sec, 4),
+                            "npu_inference_sec": round(npu_sec, 4),
+                            "save_bin_sec": round(save_sec, 4),
+                        }
+                    )
+                else:
+                    entropy_wait_t0 = time.perf_counter()
+                    entropy_semaphore.acquire()
+                    entropy_wait_sec = time.perf_counter() - entropy_wait_t0
+                    entropy_t0 = time.perf_counter()
+                    try:
+                        run_entropy_command(
+                            bin_path=bin_path,
+                            meta_path=meta_path,
+                            cnz_path=cnz_path,
+                            config=config,
+                        )
+                    finally:
+                        entropy_semaphore.release()
+                    entropy_sec = time.perf_counter() - entropy_t0
 
-                if not config["keep_bin"]:
-                    bin_path.unlink(missing_ok=True)
-                if not config["keep_latent_metadata"]:
-                    meta_path.unlink(missing_ok=True)
+                    if not config["keep_bin"]:
+                        bin_path.unlink(missing_ok=True)
+                    if not config["keep_latent_metadata"]:
+                        meta_path.unlink(missing_ok=True)
 
-                total_sec = time.perf_counter() - total_t0
-                result_queue.put(
-                    {
-                        "type": "frame",
-                        "index": index,
-                        "source": str(frame_path),
-                        "cnz": str(cnz_path.relative_to(config["output"])),
-                        "core_mask": core_mask_name,
-                        "worker_id": worker_id,
-                        "bytes": cnz_path.stat().st_size,
-                        "elapsed_sec": round(total_sec, 4),
-                        "preprocess_sec": round(pre_sec, 4),
-                        "npu_inference_sec": round(npu_sec, 4),
-                        "save_bin_sec": round(save_sec, 4),
-                        "entropy_sec": round(entropy_sec, 4),
-                        "frame_fps": round(1.0 / total_sec, 4) if total_sec > 0 else 0.0,
-                    }
-                )
+                    total_sec = time.perf_counter() - total_t0
+                    result_queue.put(
+                        {
+                            "type": "frame",
+                            "index": index,
+                            "source": str(frame_path),
+                            "cnz": str(cnz_path.relative_to(config["output"])),
+                            "core_mask": core_mask_name,
+                            "worker_id": worker_id,
+                            "bytes": cnz_path.stat().st_size,
+                            "elapsed_sec": round(total_sec, 4),
+                            "preprocess_sec": round(pre_sec, 4),
+                            "npu_inference_sec": round(npu_sec, 4),
+                            "save_bin_sec": round(save_sec, 4),
+                            "entropy_wait_sec": round(entropy_wait_sec, 4),
+                            "entropy_sec": round(entropy_sec, 4),
+                            "frame_fps": round(1.0 / total_sec, 4) if total_sec > 0 else 0.0,
+                        }
+                    )
             except Exception as exc:
                 result_queue.put(
                     {
@@ -302,7 +425,37 @@ def parse_args() -> argparse.Namespace:
         "--workers-per-core",
         type=int,
         default=2,
-        help="Use 2 if NPU load is low. This overlaps preprocess/entropy with NPU work.",
+        help="Persistent workers per NPU core. Use 2 for stability; try 3 only if the board stays stable.",
+    )
+    parser.add_argument(
+        "--entropy-workers",
+        type=int,
+        default=3,
+        help="Maximum concurrent cnz_encode_cli processes. Lower this if the board stalls.",
+    )
+    parser.add_argument(
+        "--separate-entropy",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run CNZ entropy coding in separate CPU workers so RKNN workers can keep feeding NPU.",
+    )
+    parser.add_argument(
+        "--entropy-timeout",
+        type=float,
+        default=30.0,
+        help="Seconds before one cnz_encode_cli call is treated as stuck.",
+    )
+    parser.add_argument(
+        "--stall-timeout",
+        type=float,
+        default=45.0,
+        help="Abort if no worker returns a result for this many seconds.",
+    )
+    parser.add_argument(
+        "--core-stall-timeout",
+        type=float,
+        default=25.0,
+        help="Abort if one NPU core has assigned frames but returns no frame for this many seconds.",
     )
     parser.add_argument("--codec", choices=["zlib", "none"], default="zlib")
     parser.add_argument("--zlib-level", type=int, default=1)
@@ -328,6 +481,14 @@ def main() -> None:
             raise ValueError("--height and --width must be provided together")
     if args.workers_per_core <= 0:
         raise ValueError("--workers-per-core must be > 0")
+    if args.entropy_workers <= 0:
+        raise ValueError("--entropy-workers must be > 0")
+    if args.entropy_timeout <= 0:
+        raise ValueError("--entropy-timeout must be > 0")
+    if args.stall_timeout <= 0:
+        raise ValueError("--stall-timeout must be > 0")
+    if args.core_stall_timeout <= 0:
+        raise ValueError("--core-stall-timeout must be > 0")
 
     args.input = args.input.resolve()
     args.output = args.output.resolve()
@@ -379,11 +540,12 @@ def main() -> None:
         bin_dir.mkdir(parents=True, exist_ok=True)
 
         core_masks = media_utils.parse_csv(args.core_masks)
-        worker_core_masks = [
-            core
-            for core in core_masks
-            for _ in range(args.workers_per_core)
+        worker_specs = [
+            (core_index, core)
+            for _replica in range(args.workers_per_core)
+            for core_index, core in enumerate(core_masks)
         ]
+        worker_core_masks = [core for _core_index, core in worker_specs]
         worker_count = len(worker_core_masks)
 
         manifest: Dict[str, Any] = {
@@ -401,6 +563,11 @@ def main() -> None:
             "downsampling_factor": args.downsampling_factor,
             "core_masks": core_masks,
             "workers_per_core": args.workers_per_core,
+            "entropy_workers": args.entropy_workers,
+            "separate_entropy": args.separate_entropy,
+            "entropy_timeout": args.entropy_timeout,
+            "stall_timeout": args.stall_timeout,
+            "core_stall_timeout": args.core_stall_timeout,
             "worker_count": worker_count,
             "codec": args.codec,
             "zlib_level": args.zlib_level,
@@ -416,11 +583,19 @@ def main() -> None:
         print(f"frames: {len(frames)}")
         print(f"output: {args.output}")
         print(f"workers: {worker_count}, core_masks: {','.join(worker_core_masks)}")
-        print("tip: if rknpu/load is still low, try --workers-per-core 3")
+        print(
+            f"entropy_workers: {args.entropy_workers}, "
+            f"separate_entropy: {args.separate_entropy}, "
+            f"stall_timeout: {args.stall_timeout:.1f}s, "
+            f"core_stall_timeout: {args.core_stall_timeout:.1f}s"
+        )
+        print("tip: start with --workers-per-core 2. Try 3 only if the board stays stable.")
 
         context = mp.get_context("spawn")
-        task_queue: mp.Queue = context.Queue(maxsize=0)
         result_queue: mp.Queue = context.Queue()
+        core_task_queues: List[mp.Queue] = [context.Queue(maxsize=0) for _ in core_masks]
+        entropy_queue: Optional[mp.Queue] = context.Queue(maxsize=0) if args.separate_entropy else None
+        entropy_semaphore = context.Semaphore(args.entropy_workers)
         config = {
             "rknn": str(args.rknn),
             "params": str(args.params),
@@ -434,6 +609,8 @@ def main() -> None:
             "downsampling_factor": args.downsampling_factor,
             "codec": args.codec,
             "zlib_level": args.zlib_level,
+            "entropy_timeout": args.entropy_timeout,
+            "separate_entropy": args.separate_entropy,
             "keep_bin": args.keep_bin,
             "keep_latent_metadata": args.keep_latent_metadata,
         }
@@ -441,32 +618,112 @@ def main() -> None:
         workers = [
             context.Process(
                 target=encode_worker,
-                args=(worker_id, core_mask, task_queue, result_queue, config),
+                args=(
+                    worker_id,
+                    core_mask,
+                    core_task_queues[core_index],
+                    result_queue,
+                    entropy_queue,
+                    entropy_semaphore,
+                    config,
+                ),
                 daemon=False,
             )
-            for worker_id, core_mask in enumerate(worker_core_masks)
+            for worker_id, (core_index, core_mask) in enumerate(worker_specs)
         ]
+        entropy_workers = []
+        if args.separate_entropy:
+            assert entropy_queue is not None
+            entropy_workers = [
+                context.Process(
+                    target=entropy_worker,
+                    args=(entropy_worker_id, entropy_queue, result_queue, config),
+                    daemon=False,
+                )
+                for entropy_worker_id in range(args.entropy_workers)
+            ]
         for worker in workers:
             worker.start()
+        for worker in entropy_workers:
+            worker.start()
 
+        core_assigned_counts = [0 for _ in core_masks]
         for index, frame_path in enumerate(frames):
-            task_queue.put((index, str(frame_path)))
-        for _ in workers:
-            task_queue.put(None)
+            core_index = index % len(core_masks)
+            core_assigned_counts[core_index] += 1
+            core_task_queues[core_index].put((index, str(frame_path)))
+        for core_index, task_queue in enumerate(core_task_queues):
+            for _ in range(args.workers_per_core):
+                task_queue.put(None)
 
         completed = 0
         stopped = 0
+        entropy_stopped = 0
+        entropy_stop_sent = False
         fatal_error: Optional[str] = None
         started = time.perf_counter()
+        last_result_time = time.perf_counter()
+        core_completed_counts = [0 for _ in core_masks]
+        core_last_result = [started for _ in core_masks]
+        core_index_by_mask = {core: index for index, core in enumerate(core_masks)}
 
-        while stopped < worker_count:
+        while stopped < worker_count or entropy_stopped < len(entropy_workers):
             try:
                 item = result_queue.get(timeout=0.5)
             except queue.Empty:
+                if (
+                    args.separate_entropy
+                    and stopped == worker_count
+                    and not entropy_stop_sent
+                    and entropy_queue is not None
+                ):
+                    for _ in entropy_workers:
+                        entropy_queue.put(None)
+                    entropy_stop_sent = True
                 if fatal_error is not None:
+                    break
+                idle_sec = time.perf_counter() - last_result_time
+                if idle_sec > args.stall_timeout:
+                    alive = [
+                        f"{idx}:pid={worker.pid}:alive={worker.is_alive()}"
+                        for idx, worker in enumerate(workers)
+                    ]
+                    fatal_error = (
+                        f"no worker result for {idle_sec:.1f}s; "
+                        "RKNN/CNZ worker likely stalled. "
+                        f"workers: {', '.join(alive)}"
+                    )
+                    print(f"[stall] {fatal_error}", file=sys.stderr)
+                    break
+                now = time.perf_counter()
+                stalled_cores = []
+                for core_index, core_mask in enumerate(core_masks):
+                    if core_completed_counts[core_index] >= core_assigned_counts[core_index]:
+                        continue
+                    idle_core_sec = now - core_last_result[core_index]
+                    if idle_core_sec > args.core_stall_timeout:
+                        stalled_cores.append(
+                            f"core={core_mask} idle={idle_core_sec:.1f}s "
+                            f"completed={core_completed_counts[core_index]}/"
+                            f"{core_assigned_counts[core_index]}"
+                        )
+                if stalled_cores:
+                    alive = [
+                        f"{idx}:pid={worker.pid}:alive={worker.is_alive()}"
+                        for idx, worker in enumerate(workers)
+                    ]
+                    fatal_error = (
+                        "one NPU core stopped returning frames: "
+                        + "; ".join(stalled_cores)
+                        + ". Try excluding that core with --core-masks, "
+                        "or lower --workers-per-core. "
+                        f"workers: {', '.join(alive)}"
+                    )
+                    print(f"[core-stall] {fatal_error}", file=sys.stderr)
                     break
                 continue
 
+            last_result_time = time.perf_counter()
             item_type = item.get("type")
             if item_type == "ready":
                 print(
@@ -475,6 +732,17 @@ def main() -> None:
                 )
             elif item_type == "stopped":
                 stopped += 1
+                if (
+                    args.separate_entropy
+                    and stopped == worker_count
+                    and not entropy_stop_sent
+                    and entropy_queue is not None
+                ):
+                    for _ in entropy_workers:
+                        entropy_queue.put(None)
+                    entropy_stop_sent = True
+            elif item_type == "entropy_stopped":
+                entropy_stopped += 1
             elif item_type == "fatal":
                 fatal_error = str(item.get("error"))
                 manifest["errors"].append(item)
@@ -492,6 +760,10 @@ def main() -> None:
                     break
             elif item_type == "frame":
                 completed += 1
+                core_index = core_index_by_mask.get(str(item["core_mask"]))
+                if core_index is not None and not args.separate_entropy:
+                    core_completed_counts[core_index] += 1
+                    core_last_result[core_index] = time.perf_counter()
                 manifest["frames"].append(item)
                 manifest["frames"].sort(key=lambda row: row["index"])
                 elapsed = time.perf_counter() - started
@@ -502,31 +774,71 @@ def main() -> None:
                     f"pre={item['preprocess_sec']:.3f}s "
                     f"npu={item['npu_inference_sec']:.3f}s "
                     f"save_bin={item['save_bin_sec']:.3f}s "
+                    f"entropy_wait={item.get('entropy_wait_sec', 0.0):.3f}s "
                     f"entropy={item['entropy_sec']:.3f}s "
                     f"worker={item['worker_id']} core={item['core_mask']} "
+                    f"entropy_worker={item.get('entropy_worker_id', 'inline')} "
                     f"avg_fps={avg_fps:.2f}"
                 )
 
                 manifest["elapsed_sec"] = round(elapsed, 4)
                 manifest["avg_fps"] = round(avg_fps, 4)
                 media_utils.write_manifest(manifest_path, manifest)
+            elif item_type == "npu_frame":
+                core_index = core_index_by_mask.get(str(item["core_mask"]))
+                if core_index is not None:
+                    core_completed_counts[core_index] += 1
+                    core_last_result[core_index] = time.perf_counter()
 
         if fatal_error is not None:
             for worker in workers:
+                if worker.is_alive():
+                    worker.terminate()
+            for worker in entropy_workers:
                 if worker.is_alive():
                     worker.terminate()
             raise RuntimeError(fatal_error)
 
         for worker in workers:
             worker.join()
+        for worker in entropy_workers:
+            worker.join()
 
         elapsed = time.perf_counter() - started
         frame_records = manifest["frames"]
         manifest["elapsed_sec"] = round(elapsed, 4)
         manifest["avg_fps"] = round(completed / elapsed, 4) if elapsed > 0 else 0.0
-        for key in ("preprocess_sec", "npu_inference_sec", "save_bin_sec", "entropy_sec"):
+        for key in ("preprocess_sec", "npu_inference_sec", "save_bin_sec", "entropy_wait_sec", "entropy_sec"):
             value = mean_stage(frame_records, key)
             manifest[f"avg_{key}"] = round(value, 4) if value is not None else None
+        worker_stats: Dict[str, Dict[str, Any]] = {}
+        for record in frame_records:
+            worker_key = str(record["worker_id"])
+            stats = worker_stats.setdefault(
+                worker_key,
+                {
+                    "worker_id": record["worker_id"],
+                    "core_mask": record["core_mask"],
+                    "frames": 0,
+                    "npu_total_sec": 0.0,
+                    "elapsed_total_sec": 0.0,
+                },
+            )
+            stats["frames"] += 1
+            stats["npu_total_sec"] += float(record.get("npu_inference_sec", 0.0))
+            stats["elapsed_total_sec"] += float(record.get("elapsed_sec", 0.0))
+        for stats in worker_stats.values():
+            frames_count = int(stats["frames"])
+            stats["avg_npu_sec"] = round(stats["npu_total_sec"] / frames_count, 4) if frames_count else None
+            stats["avg_elapsed_sec"] = (
+                round(stats["elapsed_total_sec"] / frames_count, 4) if frames_count else None
+            )
+            stats["npu_total_sec"] = round(stats["npu_total_sec"], 4)
+            stats["elapsed_total_sec"] = round(stats["elapsed_total_sec"], 4)
+        manifest["worker_stats"] = [
+            worker_stats[key]
+            for key in sorted(worker_stats, key=lambda item: int(item))
+        ]
         media_utils.write_manifest(manifest_path, manifest)
 
         print(
@@ -534,8 +846,16 @@ def main() -> None:
             f"pre={fmt_sec(manifest.get('avg_preprocess_sec'))}, "
             f"npu={fmt_sec(manifest.get('avg_npu_inference_sec'))}, "
             f"save_bin={fmt_sec(manifest.get('avg_save_bin_sec'))}, "
+            f"entropy_wait={fmt_sec(manifest.get('avg_entropy_wait_sec'))}, "
             f"entropy={fmt_sec(manifest.get('avg_entropy_sec'))}"
         )
+        print("worker_stats:")
+        for stats in manifest["worker_stats"]:
+            print(
+                f"  worker={stats['worker_id']} core={stats['core_mask']} "
+                f"frames={stats['frames']} avg_npu={fmt_sec(stats['avg_npu_sec'])} "
+                f"avg_total={fmt_sec(stats['avg_elapsed_sec'])}"
+            )
         print(f"done: {completed} frames, total_time={elapsed:.3f}s, avg_fps={manifest['avg_fps']:.2f}")
         print(f"manifest: {manifest_path}")
     finally:

@@ -57,13 +57,34 @@ python3 rk3588_media_compress/rk3588_fast_compress.py \
   --cnz-encode-cli rk3588_media_compress/cnz_encode_cli \
   --height 720 \
   --width 1280 \
-  --workers-per-core 2
+  --workers-per-core 2 \
+  --entropy-workers 3
 ```
 
 This keeps RKNN runtimes alive. With `--core-masks 0,1,2` and
-`--workers-per-core 2`, it starts six workers: two feeding each NPU core. If
-`sudo cat /sys/kernel/debug/rknpu/load` is still low, try
-`--workers-per-core 3`.
+`--workers-per-core 2`, it starts six workers: two feeding each NPU core.
+Use `--workers-per-core 3` only after the board runs stably.
+
+Frames are assigned to per-core queues, and workers on the same NPU core share
+that core's queue. This keeps task counts balanced across core0/core1/core2
+while still allowing multiple workers to overlap preprocessing, NPU inference,
+and entropy coding.
+
+`--entropy-workers` limits concurrent `cnz_encode_cli` processes. If the board
+stalls or entropy time jumps, keep it at `3` or reduce it to `2`.
+
+By default, RKNN inference and entropy coding run as separate pipeline stages:
+RKNN workers write `.bin` files and immediately continue feeding the NPU, while
+CPU entropy workers turn `.bin` into `.cnz` in parallel. If you want the older
+single-worker behavior for debugging, pass `--no-separate-entropy`.
+
+If one NPU core stops returning frames while other cores keep running, the
+script aborts with `core-stall` instead of waiting forever. If core0 repeatedly
+stalls on your board, run only the stable cores:
+
+```bash
+python3 rk3588_media_compress/rk3588_fast_compress.py --input input.mp4 --output out_cnz --rknn encoder_fp.rknn --params entropy_params2.json --cnz-encode-cli rk3588_media_compress/cnz_encode_cli --height 720 --width 1280 --core-masks 1,2 --workers-per-core 2 --entropy-workers 2
+```
 
 Compatibility path:
 
