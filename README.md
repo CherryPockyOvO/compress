@@ -54,11 +54,13 @@ The single retained configuration uses `N=128, M=128`, `quant_step=0.67`,
 Old lower-quality checkpoints are not useful for this code path. Old level-3
 checkpoints can still be loaded manually with `--resume` or `--checkpoint`.
 
-An experimental high-precision variant is available as
-`nano_hyper_residual_q`. It adds a quantization-friendly residual encoder,
-scale-only hyperprior, ReLU6, latent/z/scale clipping, and optional QAT fake
-quant for RKNN mixed precision experiments. It is not the default and does not
-replace the existing `nano` CNZ4 path. See
+The current high-precision training route is `nano_hyper_residual_q`. It adds a
+quantization-friendly residual encoder, scale-only hyperprior, ReLU6,
+latent/z/scale clipping, and staged QAT fake quant for RKNN mixed precision
+experiments. The three precision stages are `hyper_quality_fp`,
+`hyper_quality_qat16`, and `hyper_quality_qat8`. This route does not decode the
+old `nano` CNZ4 bitstream; CNZ5 support is still needed for full hyperprior
+deployment. See
 [`docs/nano_hyper_residual_q.md`](docs/nano_hyper_residual_q.md).
 
 ## Export Encoder ONNX
@@ -142,110 +144,120 @@ python train.py --train-dir data\train --val-dir data\val --epochs 150 --batch-s
 python val.py --data-dir D:\data\images\test --checkpoint checkpoints\latest.pt --results-dir results
 ```
 
-### High-Precision Detail Fine-Tuning
+### High-Precision Hyperprior Training
 
-Use this when you already have a trained `.pt` at the current quality level and
-want a second, higher-bpp level with better water highlights, thin bright lines,
-and local texture retention.
-The preset keeps the same model tensor shapes, so old compatible checkpoints can
-be used as the starting point. The `detail` objective combines high-frequency
-detail reconstruction with an explicit highlight-aware loss: it upweights bright
-edges, specular peaks, reflections, water ripples, and local luminance contrast.
-The training cropper also samples a minority of patches near bright or
-high-frequency regions while keeping ordinary random crops as the default
-behavior.
+Use this as the current high-precision route. It trains
+`nano_hyper_residual_q`, which uses a residual quantization-friendly encoder and
+a scale-only hyperprior:
+
+```text
+x -> residual g_a -> y
+       y -> h_a -> z -> entropy bottleneck -> z_hat -> h_s -> scales_y
+       y + scales_y -> Gaussian conditional entropy -> y_hat -> g_s -> x_hat
+```
+
+This is different from the legacy `detail/detail_peak` route. `detail` and
+`detail_peak` keep the old `nano` factorized-prior shape and CNZ4 path; they do
+not use the new residual encoder or hyperprior.
+
+The full runbook is in
+[`docs/high_precision_training.md`](docs/high_precision_training.md). On this
+workstation the intended Python environment is:
 
 ```bash
-python train.py \
-  --quality-profile detail \
-  --init-checkpoint checkpoints/latest.pt \
+source /home/zzw/miniconda3/bin/activate net
+```
+
+or call the environment tools directly:
+
+```bash
+/home/zzw/miniconda3/envs/net/bin/python
+/home/zzw/miniconda3/envs/net/bin/torchrun
+```
+
+The current three precision stages are:
+
+1. `hyper_quality_fp`: full-precision baseline training, no fake quant.
+2. `hyper_quality_qat16`: 16-bit fake quant fine-tuning for `y`, `z`, and
+   `scales_y`.
+3. `hyper_quality_qat8`: 8-bit fake quant fine-tuning for the same tensors.
+
+Start stage 1 from scratch. Do not initialize from `checkpoints_detail/*.pt`,
+because the old `nano` model uses `M=128` factorized latents while
+`nano_hyper_residual_q` uses `M=160`, `Z=96`, and a hyperprior.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2 /home/zzw/miniconda3/envs/net/bin/torchrun \
+  --standalone \
+  --nproc_per_node=3 \
+  train.py \
+  --quality-profile hyper_quality_fp \
   --train-dir data/train \
   --val-dir data/val \
-  --checkpoint-dir checkpoints_detail \
+  --checkpoint-dir checkpoints_hyper_quality_fp \
   --checkpoint-interval-steps 100 \
-  --max-steps 5000
+  --eval-interval-steps 100 \
+  --max-steps 8000 \
+  --num-workers 8
 ```
 
-For three local GPUs, launch the same run with PyTorch DDP:
+After stage 1, continue with QAT16:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2 torchrun --standalone --nproc_per_node=3 train.py \
-  --quality-profile detail \
-  --init-checkpoint checkpoints/latest.pt \
+CUDA_VISIBLE_DEVICES=0,1,2 /home/zzw/miniconda3/envs/net/bin/torchrun \
+  --standalone \
+  --nproc_per_node=3 \
+  train.py \
+  --quality-profile hyper_quality_qat16 \
+  --init-checkpoint checkpoints_hyper_quality_fp/best.pt \
   --train-dir data/train \
   --val-dir data/val \
-  --checkpoint-dir checkpoints_detail \
+  --checkpoint-dir checkpoints_hyper_quality_qat16 \
   --checkpoint-interval-steps 100 \
-  --max-steps 5000
+  --eval-interval-steps 100 \
+  --max-steps 3000 \
+  --num-workers 8
 ```
 
-In DDP mode `--batch-size` is per GPU. The `detail` preset uses
-`batch_size=32`, so three GPUs train with an effective global batch of 96.
-Only rank 0 prints progress and writes `eN.pt`, `latest.pt`, and `best.pt`.
-
-The `detail` preset expands to `lambda=0.05`, `target_bpp=None`,
-`rate_weight=0.25`, `ssim_weight=0.05`, `detail_weight=1.5`,
-`highlight_weight=1.0`, `highlight_under_weight=1.0`,
-`highlight_lap_weight=0.8`, `texture_lap_weight=1.0`,
-`texture_contrast_weight=0.4`, `l1_weight=0.10`, `lpips_weight=0.003`,
-`quant_step=0.50`, `crop_size=384`, `batch_size=32`, `lr=1e-5`, and
-`epochs=80`. The balanced preset uses `batch_size=128` with `crop_size=256`.
-Override any of these on the command line if your GPU memory or target bitrate
-needs a different tradeoff.
-
-For high-bpp highlight peak and edge fine-tuning from an existing detail
-checkpoint, use `detail_peak`. It keeps `quant_step=0.50`, lowers the learning
-rate to `5e-6`, and raises `detail_weight=1.8` plus `highlight_weight=1.5`:
+Then continue with QAT8:
 
 ```bash
-python train.py \
-  --quality-profile detail_peak \
-  --init-checkpoint checkpoints_detail/best.pt \
+CUDA_VISIBLE_DEVICES=0,1,2 /home/zzw/miniconda3/envs/net/bin/torchrun \
+  --standalone \
+  --nproc_per_node=3 \
+  train.py \
+  --quality-profile hyper_quality_qat8 \
+  --init-checkpoint checkpoints_hyper_quality_qat16/best.pt \
   --train-dir data/train \
   --val-dir data/val \
-  --checkpoint-dir checkpoints_detail_peak \
+  --checkpoint-dir checkpoints_hyper_quality_qat8 \
   --checkpoint-interval-steps 100 \
-  --max-steps 2000
+  --eval-interval-steps 100 \
+  --max-steps 2000 \
+  --num-workers 8
 ```
 
-Watch `val_peak_under`, `val_highlight_lap`, `val_highlight_contrast`, and
-`val_lpips_loss`. If water ripples or highlights are still too weak, try:
+In DDP mode `--batch-size` is per GPU. The `hyper_quality_*` presets use
+`batch_size=24`, so three GPUs train with an effective global batch of 72.
+With the current local split of about 40001 train images, one epoch is about
+556 optimizer steps. Only rank 0 prints progress and writes `eN.pt`,
+`latest.pt`, and `best.pt`.
+
+Export the high-precision analysis model after training:
 
 ```bash
---highlight-under-weight 1.3 --highlight-weight 1.5
+/home/zzw/miniconda3/envs/net/bin/python tools/export_encoder_onnx.py --checkpoint checkpoints_hyper_quality_qat8/best.pt --output encoder_hyper_y.onnx --height 720 --width 1280
+/home/zzw/miniconda3/envs/net/bin/python tools/export_encoder_onnx.py --checkpoint checkpoints_hyper_quality_qat8/best.pt --output analysis_hyper.onnx --export-mode analysis --height 720 --width 1280
 ```
 
-If highlights are bright enough but edges are still soft, try:
+The hyperprior model currently supports training and ONNX/RKNN analysis export.
+It does not yet support CNZ4 encode/decode; full bitstream deployment needs a
+future CNZ5 format carrying both `z` and `y`.
+
+For a PyTorch reconstruction roundtrip before CNZ5 exists:
 
 ```bash
---highlight-lap-weight 1.0 --texture-lap-weight 1.2 --texture-contrast-weight 0.5
-```
-
-If you see halo artifacts, false highlights, or white edge fringing, try:
-
-```bash
---highlight-weight 1.0 --highlight-under-weight 0.7 --highlight-lap-weight 0.8 --texture-contrast-weight 0.4
-```
-
-Checkpoints are saved by optimizer step, not by epoch: with the default
-`--checkpoint-interval-steps 100`, step 100 writes `e1.pt`, step 200 writes
-`e2.pt`, and so on. `latest.pt` is updated at the same save points. For large
-datasets, prefer `--max-steps` over counting full epochs. With 50k images and
-`batch_size=32`, one epoch is about 1563 optimizer steps, so `--max-steps 5000`
-is roughly 3.2 epochs.
-
-Export and deploy the high-precision level from the new checkpoint directory:
-
-```bash
-python tools/export_encoder_onnx.py --checkpoint checkpoints_detail/latest.pt --output encoder_detail.onnx --height 512 --width 512
-python tools/export_entropy_params.py --checkpoint checkpoints_detail/latest.pt --output entropy_params_detail.json
-```
-
-Simulate RK3588 encode and PC decode:
-
-```powershell
-python encode_image.py test.jpg --checkpoint checkpoints\latest.pt --output stream.cnz
-python decode_cnz.py stream.cnz --checkpoint checkpoints\latest.pt --output recon.png
+/home/zzw/miniconda3/envs/net/bin/python roundtrip_image.py samples/test.jpg --checkpoint checkpoints_hyper_quality_fp/latest.pt --mode forward --output-dir roundtrip_hyper_test --timing
 ```
 
 ## RK3588 Deployment Path

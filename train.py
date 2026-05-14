@@ -45,7 +45,7 @@ TRAIN_PROFILES = {
         "detail_weight": 0.0,
         "highlight_weight": 0.0,
         "highlight_under_weight": 1.0,
-        "highlight_lap_weight": 0.8,
+        "highlight_lap_weight": 0.8,    
         "texture_lap_weight": 1.0,
         "texture_contrast_weight": 0.4,
         "l1_weight": 0.0,
@@ -1742,9 +1742,7 @@ def parse_args() -> argparse.Namespace:
         "--highlight-peak-under-weight",
         type=float,
         default=None,
-        help=(
-            "Deprecated alias for --highlight-under-weight.",
-        ),
+        help="Deprecated alias for --highlight-under-weight.",
     )
     parser.add_argument(
         "--highlight-under-weight",

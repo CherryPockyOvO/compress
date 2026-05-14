@@ -5,6 +5,11 @@ existing nano codec project. The default model is still `nano`; this variant is
 enabled only with `--model-variant nano_hyper_residual_q` or with one of the
 `hyper_quality_*` training profiles.
 
+For the current three-stage high-precision training route, start with
+[`high_precision_training.md`](high_precision_training.md). That runbook trains
+this `nano_hyper_residual_q` model through `hyper_quality_fp`,
+`hyper_quality_qat16`, and `hyper_quality_qat8`.
+
 ## Goals
 
 - Improve reconstruction of highlights, water texture, line art, and fine local

@@ -7,11 +7,16 @@ checkpoints_*/
 data/
 *.jpg
 *.png
+*.mp4
 *.cnz
 *.bin
 *.onnx
 entropy_params.json
 entropy_params2.json
+entropy_params_*.json
+*.decode_manifest.json
+out_cnz/
+roundtrip/
 dist/
 
 # 排除 Python 緩存

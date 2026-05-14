@@ -12,6 +12,11 @@ from decode_cnz import crop_to_size, tensor_to_image
 from encode_image import image_to_tensor, load_checkpoint, pad_to_multiple
 
 
+def likelihood_bpp(likelihood: torch.Tensor, pixels: int) -> float:
+    bits = torch.sum(-torch.log2(likelihood.detach().float().clamp_min(1e-9)))
+    return float(bits.cpu()) / float(pixels)
+
+
 def sync_device(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -103,6 +108,60 @@ def encode_decode_image(
     }
 
 
+def forward_reconstruct_image(
+    model: torch.nn.Module,
+    image_path: Path,
+    recon_path: Path,
+    device: torch.device,
+) -> dict[str, float | str | tuple[int, int] | tuple[int, ...]]:
+    x = image_to_tensor(image_path).to(device)
+    padding_multiple = int(model.downsampling_factor)
+    if not getattr(model, "supports_cnz_v4", False):
+        # The hyperprior path downsamples the latent twice more in h_a and
+        # upsamples it in h_s, so y spatial dimensions must be divisible by 4.
+        padding_multiple *= 4
+    x_padded, original_size = pad_to_multiple(x, padding_multiple)
+
+    t0 = now_synced(device)
+    with torch.inference_mode():
+        output = model(x_padded)
+        x_hat = crop_to_size(output["x_hat"], original_size)
+    t1 = now_synced(device)
+
+    tensor_to_image(x_hat, recon_path)
+    t2 = now_synced(device)
+
+    pixels = original_size[0] * original_size[1]
+    likelihoods = output.get("likelihoods", {})
+    bpp_y = (
+        likelihood_bpp(likelihoods["y"], pixels)
+        if isinstance(likelihoods, dict) and "y" in likelihoods
+        else 0.0
+    )
+    bpp_z = (
+        likelihood_bpp(likelihoods["z"], pixels)
+        if isinstance(likelihoods, dict) and "z" in likelihoods
+        else 0.0
+    )
+    y = output.get("y")
+    z = output.get("z")
+    scales_y = output.get("scales_y")
+
+    return {
+        "original_size": original_size,
+        "padded_size": tuple(int(v) for v in x_padded.shape[-2:]),
+        "latent_shape": tuple(int(v) for v in y.shape) if torch.is_tensor(y) else (),
+        "z_shape": tuple(int(v) for v in z.shape) if torch.is_tensor(z) else (),
+        "scales_shape": tuple(int(v) for v in scales_y.shape) if torch.is_tensor(scales_y) else (),
+        "bpp_y": bpp_y,
+        "bpp_z": bpp_z,
+        "estimated_bpp": bpp_y + bpp_z,
+        "forward_ms": (t1 - t0) * 1000.0,
+        "save_recon_ms": (t2 - t1) * 1000.0,
+        "total_ms": (t2 - t0) * 1000.0,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Encode one image to CNZ and immediately decode it with one checkpoint load."
@@ -114,6 +173,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--recon-output", type=Path, default=None)
     parser.add_argument("--codec", choices=("zlib", "none"), default="zlib")
     parser.add_argument("--zlib-level", type=int, default=1)
+    parser.add_argument(
+        "--mode",
+        choices=("auto", "cnz4", "forward"),
+        default="auto",
+        help=(
+            "auto uses CNZ4 for old nano checkpoints and forward reconstruction "
+            "for hyperprior checkpoints. cnz4 requires a CNZ4-capable model."
+        ),
+    )
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--timing", action="store_true")
@@ -137,37 +205,63 @@ def main() -> None:
     model_variant = infer_model_variant_from_checkpoint(raw)
     model = get_model(model_variant=model_variant).to(device).eval()
     load_checkpoint(model, args.checkpoint)
-    if not getattr(model, "supports_cnz_v4", False):
+    supports_cnz_v4 = bool(getattr(model, "supports_cnz_v4", False))
+    mode = args.mode
+    if mode == "auto":
+        mode = "cnz4" if supports_cnz_v4 else "forward"
+    if mode == "cnz4" and not supports_cnz_v4:
         raise RuntimeError(
-            f"{model_variant} is a hyperprior model and needs CNZ5 support before "
-            "roundtrip_image.py can encode/decode it."
+            f"{model_variant} is a hyperprior model and cannot be encoded as CNZ4. "
+            "Use --mode forward for PyTorch reconstruction, or add CNZ5 support "
+            "for a real hyperprior bitstream roundtrip."
         )
 
-    stats = encode_decode_image(
-        model=model,
-        image_path=args.image,
-        cnz_path=cnz_path,
-        recon_path=recon_path,
-        device=device,
-        codec=args.codec,
-        zlib_level=args.zlib_level,
-    )
+    if mode == "cnz4":
+        stats = encode_decode_image(
+            model=model,
+            image_path=args.image,
+            cnz_path=cnz_path,
+            recon_path=recon_path,
+            device=device,
+            codec=args.codec,
+            zlib_level=args.zlib_level,
+        )
+    else:
+        stats = forward_reconstruct_image(
+            model=model,
+            image_path=args.image,
+            recon_path=recon_path,
+            device=device,
+        )
 
     print(f"image: {args.image}")
     print(f"checkpoint: {args.checkpoint}")
-    print(f"cnz: {cnz_path}")
+    print(f"model_variant: {model_variant}")
+    print(f"mode: {mode}")
+    if mode == "cnz4":
+        print(f"cnz: {cnz_path}")
     print(f"recon: {recon_path}")
     print(f"original_size: {stats['original_size']}")
     print(f"padded_size: {stats['padded_size']}")
     print(f"latent_shape: {stats['latent_shape']}")
-    print(f"dtype: {stats['dtype']}")
-    print(f"codec: {stats['codec']}")
-    print(f"payload_bpp: {stats['payload_bpp']:.4f}")
-    print(f"container_bpp: {stats['container_bpp']:.4f}")
+    if mode == "cnz4":
+        print(f"dtype: {stats['dtype']}")
+        print(f"codec: {stats['codec']}")
+        print(f"payload_bpp: {stats['payload_bpp']:.4f}")
+        print(f"container_bpp: {stats['container_bpp']:.4f}")
+    else:
+        print(f"z_shape: {stats['z_shape']}")
+        print(f"scales_shape: {stats['scales_shape']}")
+        print(f"bpp_y: {stats['bpp_y']:.4f}")
+        print(f"bpp_z: {stats['bpp_z']:.4f}")
+        print(f"estimated_bpp: {stats['estimated_bpp']:.4f}")
     if args.timing:
-        print(f"timing_encode_ms: {stats['encode_ms']:.3f}")
-        print(f"timing_write_cnz_ms: {stats['write_cnz_ms']:.3f}")
-        print(f"timing_decode_model_ms: {stats['decode_model_ms']:.3f}")
+        if mode == "cnz4":
+            print(f"timing_encode_ms: {stats['encode_ms']:.3f}")
+            print(f"timing_write_cnz_ms: {stats['write_cnz_ms']:.3f}")
+            print(f"timing_decode_model_ms: {stats['decode_model_ms']:.3f}")
+        else:
+            print(f"timing_forward_ms: {stats['forward_ms']:.3f}")
         print(f"timing_save_recon_ms: {stats['save_recon_ms']:.3f}")
         print(f"timing_total_ms: {stats['total_ms']:.3f}")
 
