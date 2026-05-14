@@ -5,12 +5,26 @@ import sys
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from compressai_nano import FactorizedPriorNano
+from compressai_nano import get_model, infer_model_variant_from_checkpoint
+
+
+class AnalysisExportWrapper(nn.Module):
+    def __init__(self, model: nn.Module) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not hasattr(self.model, "analysis_transform"):
+            y = self.model.encoder(x)
+            zeros = y.new_zeros(1)
+            return y, zeros, zeros
+        return self.model.analysis_transform(x)
 
 
 def load_checkpoint(model: torch.nn.Module, checkpoint: Path) -> None:
@@ -29,6 +43,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Export only FactorizedPriorNano encoder to ONNX.")
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--export-mode",
+        choices=("encoder", "analysis"),
+        default="encoder",
+        help="encoder exports image->y. analysis exports image->(y,z,scales_y) when supported.",
+    )
     parser.add_argument("--height", type=int, default=512)
     parser.add_argument("--width", type=int, default=512)
     parser.add_argument("--opset", type=int, default=12)
@@ -38,7 +58,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    model = FactorizedPriorNano().eval()
+    raw = torch.load(args.checkpoint, map_location="cpu")
+    model_variant = infer_model_variant_from_checkpoint(raw)
+    model = get_model(model_variant=model_variant).eval()
     load_checkpoint(model, args.checkpoint)
     dummy = torch.randn(1, 3, args.height, args.width)
     dynamic_axes = None
@@ -47,22 +69,33 @@ def main() -> None:
             "input": {0: "batch", 2: "height", 3: "width"},
             "latent": {0: "batch", 2: "latent_height", 3: "latent_width"},
         }
+        if args.export_mode == "analysis":
+            dynamic_axes["hyper_latent"] = {0: "batch", 2: "hyper_height", 3: "hyper_width"}
+            dynamic_axes["scales_y"] = {0: "batch", 2: "latent_height", 3: "latent_width"}
+    export_module: nn.Module = model.encoder
+    output_names = ["latent"]
+    if args.export_mode == "analysis":
+        export_module = AnalysisExportWrapper(model)
+        output_names = ["latent", "hyper_latent", "scales_y"]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     torch.onnx.export(
-        model.encoder,
+        export_module,
         dummy,
         args.output.as_posix(),
         export_params=True,
         opset_version=args.opset,
         do_constant_folding=True,
         input_names=["input"],
-        output_names=["latent"],
+        output_names=output_names,
         dynamic_axes=dynamic_axes,
     )
     with torch.no_grad():
-        latent = model.encoder(dummy)
+        exported = export_module(dummy)
+        latent = exported[0] if isinstance(exported, tuple) else exported
     print(f"encoder input : {tuple(dummy.shape)}")
     print(f"encoder output: {tuple(latent.shape)}")
+    print(f"model_variant : {model_variant}")
+    print(f"export_mode   : {args.export_mode}")
     print(f"saved: {args.output}")
 
 

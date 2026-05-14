@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from compressai_nano import FactorizedPriorNano
+from compressai_nano import get_model, infer_model_variant_from_checkpoint
 
 
 def load_checkpoint(model: torch.nn.Module, checkpoint: Path) -> None:
@@ -66,6 +66,11 @@ def parse_args() -> argparse.Namespace:
         help="Metadata JSON path. Defaults to <output>.json.",
     )
     parser.add_argument("--no-meta", action="store_true")
+    parser.add_argument(
+        "--dump-analysis-json",
+        action="store_true",
+        help="For hyperprior models, also write z/scales_y statistics to metadata.",
+    )
     parser.add_argument("--cpu", action="store_true")
     return parser.parse_args()
 
@@ -73,7 +78,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
-    model = FactorizedPriorNano().to(device).eval()
+    raw = torch.load(args.checkpoint, map_location="cpu")
+    model_variant = infer_model_variant_from_checkpoint(raw)
+    model = get_model(model_variant=model_variant).to(device).eval()
     load_checkpoint(model, args.checkpoint)
     x, source_size, encoded_size = image_to_tensor(args.image, args.height, args.width)
     x = x.to(device)
@@ -85,6 +92,19 @@ def main() -> None:
         x = F.pad(x, (0, pad_w, 0, pad_h), mode="replicate")
     with torch.no_grad():
         y = model.encoder(x).detach().cpu().contiguous()
+        analysis = None
+        if args.dump_analysis_json and hasattr(model, "analysis_transform"):
+            y_live, z_live, scales_live = model.analysis_transform(x)
+            analysis = {
+                "z_shape": [int(v) for v in z_live.shape],
+                "scales_y_shape": [int(v) for v in scales_live.shape],
+                "y_min": float(y_live.min().detach().cpu()),
+                "y_max": float(y_live.max().detach().cpu()),
+                "z_min": float(z_live.min().detach().cpu()),
+                "z_max": float(z_live.max().detach().cpu()),
+                "scale_min": float(scales_live.min().detach().cpu()),
+                "scale_max": float(scales_live.max().detach().cpu()),
+            }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     y.numpy().astype("<f4", copy=False).tofile(args.output)
     if not args.no_meta:
@@ -92,6 +112,7 @@ def main() -> None:
         meta_path.parent.mkdir(parents=True, exist_ok=True)
         metadata = {
             "format": "compressai-nano-latent-metadata-v1",
+            "model_variant": model_variant,
             "image": str(args.image),
             "dtype": "float32",
             "layout": "NCHW",
@@ -106,11 +127,14 @@ def main() -> None:
             "latent_w": int(y.shape[3]),
             "downsampling_factor": int(factor),
         }
+        if analysis is not None:
+            metadata["analysis"] = analysis
         meta_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     print(f"source_size: {source_size}")
     print(f"encoded_size: {encoded_size}")
     print(f"padded_size: {tuple(int(v) for v in x.shape[-2:])}")
     print(f"latent_shape: {tuple(y.shape)}")
+    print(f"model_variant: {model_variant}")
     print(f"saved: {args.output}")
     if not args.no_meta:
         print(f"metadata: {meta_path}")

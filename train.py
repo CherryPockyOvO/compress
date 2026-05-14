@@ -20,7 +20,16 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
-from compressai_nano import FactorizedPriorNano
+from compressai_nano import (
+    MODEL_CONFIGS,
+    MODEL_VARIANT_HYPER_RESIDUAL_Q,
+    MODEL_VARIANT_NANO,
+    QATSettings,
+    get_model,
+    infer_model_variant_from_checkpoint,
+    model_config_to_dict,
+    normalize_model_variant,
+)
 
 
 IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
@@ -88,6 +97,102 @@ TRAIN_PROFILES = {
         "crop_size": 384,
         "lr": 5e-6,
     },
+    "hyper_quality_fp": {
+        "model_variant": MODEL_VARIANT_HYPER_RESIDUAL_Q,
+        "lmbda": 0.06,
+        "rate_weight": 0.35,
+        "target_bpp": None,
+        "ssim_weight": 0.05,
+        "detail_weight": 1.2,
+        "highlight_weight": 0.8,
+        "highlight_under_weight": 1.0,
+        "highlight_lap_weight": 0.8,
+        "texture_lap_weight": 1.0,
+        "texture_contrast_weight": 0.4,
+        "l1_weight": 0.08,
+        "lpips_weight": 0.002,
+        "lpips_net": "alex",
+        "quant_step": 0.45,
+        "epochs": 100,
+        "batch_size": 24,
+        "crop_size": 384,
+        "lr": 1e-4,
+        "enable_latent_fake_quant": False,
+        "enable_z_fake_quant": False,
+        "enable_scale_fake_quant": False,
+        "latent_range_weight": 0.0,
+        "z_range_weight": 0.0,
+        "symbol_range_weight": 0.0,
+        "scale_range_weight": 0.0,
+    },
+    "hyper_quality_qat16": {
+        "model_variant": MODEL_VARIANT_HYPER_RESIDUAL_Q,
+        "lmbda": 0.06,
+        "rate_weight": 0.35,
+        "target_bpp": None,
+        "ssim_weight": 0.05,
+        "detail_weight": 1.2,
+        "highlight_weight": 0.8,
+        "highlight_under_weight": 1.0,
+        "highlight_lap_weight": 0.8,
+        "texture_lap_weight": 1.0,
+        "texture_contrast_weight": 0.4,
+        "l1_weight": 0.08,
+        "lpips_weight": 0.002,
+        "lpips_net": "alex",
+        "quant_step": 0.45,
+        "epochs": 40,
+        "batch_size": 24,
+        "crop_size": 384,
+        "lr": 1e-5,
+        "enable_latent_fake_quant": True,
+        "latent_fake_quant_bits": 16,
+        "latent_fake_quant_clip": 6.0,
+        "enable_z_fake_quant": True,
+        "z_fake_quant_bits": 16,
+        "z_fake_quant_clip": 6.0,
+        "enable_scale_fake_quant": True,
+        "scale_fake_quant_bits": 16,
+        "scale_fake_quant_clip": 8.0,
+        "latent_range_weight": 0.01,
+        "z_range_weight": 0.01,
+        "symbol_range_weight": 0.001,
+        "scale_range_weight": 0.001,
+    },
+    "hyper_quality_qat8": {
+        "model_variant": MODEL_VARIANT_HYPER_RESIDUAL_Q,
+        "lmbda": 0.06,
+        "rate_weight": 0.35,
+        "target_bpp": None,
+        "ssim_weight": 0.05,
+        "detail_weight": 1.2,
+        "highlight_weight": 0.8,
+        "highlight_under_weight": 1.0,
+        "highlight_lap_weight": 0.8,
+        "texture_lap_weight": 1.0,
+        "texture_contrast_weight": 0.4,
+        "l1_weight": 0.08,
+        "lpips_weight": 0.002,
+        "lpips_net": "alex",
+        "quant_step": 0.45,
+        "epochs": 30,
+        "batch_size": 24,
+        "crop_size": 384,
+        "lr": 5e-6,
+        "enable_latent_fake_quant": True,
+        "latent_fake_quant_bits": 8,
+        "latent_fake_quant_clip": 6.0,
+        "enable_z_fake_quant": True,
+        "z_fake_quant_bits": 8,
+        "z_fake_quant_clip": 6.0,
+        "enable_scale_fake_quant": True,
+        "scale_fake_quant_bits": 8,
+        "scale_fake_quant_clip": 8.0,
+        "latent_range_weight": 0.01,
+        "z_range_weight": 0.01,
+        "symbol_range_weight": 0.001,
+        "scale_range_weight": 0.001,
+    },
 }
 
 
@@ -95,6 +200,7 @@ TRAIN_PROFILES = {
 class CheckpointState:
     epoch: int
     global_step: int
+    model_variant: str = MODEL_VARIANT_NANO
 
 
 @dataclass(frozen=True)
@@ -140,6 +246,65 @@ class RunningBppStats:
         metrics[key("bpp_min")] = self.minimum
         metrics[key("bpp_max")] = self.maximum
         metrics[key("bpp_std")] = math.sqrt(variance)
+
+
+BASE_METRIC_KEYS = [
+    "loss",
+    "mse",
+    "bpp",
+    "bpp_y",
+    "bpp_z",
+    "bpp_total",
+    "rate_loss",
+    "ssim",
+    "detail_loss",
+    "highlight_loss",
+    "highlight_under_loss",
+    "peak_under",
+    "highlight_lap",
+    "highlight_contrast",
+    "l1_loss",
+    "lpips_loss",
+    "latent_range_loss",
+    "z_range_loss",
+    "symbol_range_loss",
+    "scale_range_loss",
+    "latent_y_min",
+    "latent_y_max",
+    "latent_y_mean",
+    "latent_y_std",
+    "latent_y_p01",
+    "latent_y_p99",
+    "latent_y_clip_ratio",
+    "latent_z_min",
+    "latent_z_max",
+    "latent_z_mean",
+    "latent_z_std",
+    "latent_z_p01",
+    "latent_z_p99",
+    "latent_z_clip_ratio",
+    "scale_min",
+    "scale_max",
+    "scale_mean",
+    "scale_std",
+    "scale_p01",
+    "scale_p99",
+    "symbol_y_min",
+    "symbol_y_max",
+    "symbol_y_std",
+    "symbol_y_p99_abs",
+    "symbol_z_min",
+    "symbol_z_max",
+    "symbol_z_std",
+    "symbol_z_p99_abs",
+    "fake_quant_y_error",
+    "fake_quant_z_error",
+    "fake_quant_scale_error",
+]
+
+
+def make_metric_totals() -> dict[str, float]:
+    return {key: 0.0 for key in BASE_METRIC_KEYS}
 
 
 def read_env_int(name: str, default: int) -> int:
@@ -426,7 +591,7 @@ class ToTensor:
 
 def make_train_transform(crop_size: int, quality_profile: str = "balanced") -> Compose:
     crop: Callable[[Image.Image], Image.Image]
-    if quality_profile == "detail":
+    if quality_profile in {"detail", "detail_peak"} or quality_profile.startswith("hyper_quality"):
         crop = DetailAwareRandomCrop(crop_size, p_detail=0.3)
     else:
         crop = RandomCrop(crop_size)
@@ -465,6 +630,114 @@ def compute_bpp_per_image(
     for likelihood in likelihoods.values():
         bits = bits + torch.sum(-torch.log2(likelihood.clamp_min(1e-9)).flatten(1), dim=1)
     return bits / float(num_pixels_per_image)
+
+
+def compute_likelihood_bpp(likelihood: torch.Tensor | None, num_pixels_per_image: int) -> torch.Tensor:
+    if likelihood is None:
+        return torch.zeros(())
+    bits = torch.sum(-torch.log2(likelihood.clamp_min(1e-9)).flatten(1), dim=1)
+    return (bits / float(num_pixels_per_image)).mean()
+
+
+def tensor_stats(
+    tensor: torch.Tensor | None,
+    prefix: str,
+    clip: float | None = None,
+) -> dict[str, torch.Tensor]:
+    if tensor is None:
+        zero = torch.zeros(())
+        return {
+            f"{prefix}_min": zero,
+            f"{prefix}_max": zero,
+            f"{prefix}_mean": zero,
+            f"{prefix}_std": zero,
+            f"{prefix}_p01": zero,
+            f"{prefix}_p99": zero,
+            f"{prefix}_clip_ratio": zero,
+        }
+
+    values = tensor.detach().float().reshape(-1)
+    zero = values.new_zeros(())
+    if values.numel() == 0:
+        return {
+            f"{prefix}_min": zero,
+            f"{prefix}_max": zero,
+            f"{prefix}_mean": zero,
+            f"{prefix}_std": zero,
+            f"{prefix}_p01": zero,
+            f"{prefix}_p99": zero,
+            f"{prefix}_clip_ratio": zero,
+        }
+    clip_ratio = zero
+    if clip is not None and clip > 0:
+        clip_ratio = (values.abs() >= float(clip) * 0.999).to(values.dtype).mean()
+    return {
+        f"{prefix}_min": values.min(),
+        f"{prefix}_max": values.max(),
+        f"{prefix}_mean": values.mean(),
+        f"{prefix}_std": values.std(unbiased=False),
+        f"{prefix}_p01": torch.quantile(values, 0.01),
+        f"{prefix}_p99": torch.quantile(values, 0.99),
+        f"{prefix}_clip_ratio": clip_ratio,
+    }
+
+
+def scale_stats(tensor: torch.Tensor | None) -> dict[str, torch.Tensor]:
+    if tensor is None:
+        zero = torch.zeros(())
+        return {
+            "scale_min": zero,
+            "scale_max": zero,
+            "scale_mean": zero,
+            "scale_std": zero,
+            "scale_p01": zero,
+            "scale_p99": zero,
+        }
+    values = tensor.detach().float().reshape(-1)
+    zero = values.new_zeros(())
+    if values.numel() == 0:
+        return {
+            "scale_min": zero,
+            "scale_max": zero,
+            "scale_mean": zero,
+            "scale_std": zero,
+            "scale_p01": zero,
+            "scale_p99": zero,
+        }
+    return {
+        "scale_min": values.min(),
+        "scale_max": values.max(),
+        "scale_mean": values.mean(),
+        "scale_std": values.std(unbiased=False),
+        "scale_p01": torch.quantile(values, 0.01),
+        "scale_p99": torch.quantile(values, 0.99),
+    }
+
+
+def symbol_stats(symbols: torch.Tensor | None, prefix: str) -> dict[str, torch.Tensor]:
+    if symbols is None:
+        zero = torch.zeros(())
+        return {
+            f"{prefix}_min": zero,
+            f"{prefix}_max": zero,
+            f"{prefix}_std": zero,
+            f"{prefix}_p99_abs": zero,
+        }
+    values = symbols.detach().float().reshape(-1)
+    zero = values.new_zeros(())
+    if values.numel() == 0:
+        return {
+            f"{prefix}_min": zero,
+            f"{prefix}_max": zero,
+            f"{prefix}_std": zero,
+            f"{prefix}_p99_abs": zero,
+        }
+    return {
+        f"{prefix}_min": values.min(),
+        f"{prefix}_max": values.max(),
+        f"{prefix}_std": values.std(unbiased=False),
+        f"{prefix}_p99_abs": torch.quantile(values.abs(), 0.99),
+    }
 
 
 def ssim_index(x: torch.Tensor, y: torch.Tensor, window_size: int = 11) -> torch.Tensor:
@@ -718,6 +991,10 @@ class RateDistortionLoss(nn.Module):
         l1_weight: float = 0.0,
         lpips_weight: float = 0.0,
         lpips_net: str = "alex",
+        latent_range_weight: float = 0.0,
+        z_range_weight: float = 0.0,
+        symbol_range_weight: float = 0.0,
+        scale_range_weight: float = 0.0,
     ) -> None:
         super().__init__()
         self.lmbda = float(lmbda)
@@ -733,6 +1010,10 @@ class RateDistortionLoss(nn.Module):
         self.l1_weight = float(l1_weight)
         self.lpips_weight = float(lpips_weight)
         self.lpips_net = lpips_net
+        self.latent_range_weight = float(latent_range_weight)
+        self.z_range_weight = float(z_range_weight)
+        self.symbol_range_weight = float(symbol_range_weight)
+        self.scale_range_weight = float(scale_range_weight)
         self.lpips_model = make_lpips_model(lpips_net) if self.lpips_weight > 0 else None
 
     def forward(self, output: dict[str, Any], target: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -741,6 +1022,15 @@ class RateDistortionLoss(nn.Module):
         num_pixels_per_image = target.size(2) * target.size(3)
         bpp_per_image = compute_bpp_per_image(output["likelihoods"], num_pixels_per_image)
         bpp = bpp_per_image.mean()
+        bpp_y = compute_likelihood_bpp(output["likelihoods"].get("y"), num_pixels_per_image).to(
+            device=mse.device,
+            dtype=mse.dtype,
+        )
+        bpp_z = compute_likelihood_bpp(output["likelihoods"].get("z"), num_pixels_per_image).to(
+            device=mse.device,
+            dtype=mse.dtype,
+        )
+        bpp_total = bpp_y + bpp_z
         if self.target_bpp is None:
             rate_loss = bpp
         else:
@@ -782,6 +1072,47 @@ class RateDistortionLoss(nn.Module):
                 ).mean()
         else:
             lpips_loss = mse.new_zeros(())
+
+        y = output.get("y")
+        z = output.get("z")
+        scales_y = output.get("scales_y")
+        symbols = output.get("symbols", {})
+        symbol_y = symbols.get("y") if isinstance(symbols, dict) else None
+        symbol_z = symbols.get("z") if isinstance(symbols, dict) else None
+
+        y_clip = output.get("latent_clip", None)
+        z_clip = output.get("z_clip", None)
+        if y_clip is None and y is not None:
+            y_clip = 6.0 if output.get("model_variant") == MODEL_VARIANT_HYPER_RESIDUAL_Q else None
+        if z_clip is None and z is not None:
+            z_clip = 6.0 if output.get("model_variant") == MODEL_VARIANT_HYPER_RESIDUAL_Q else None
+
+        if self.latent_range_weight > 0 and y is not None and y_clip is not None and y_clip > 0:
+            latent_range_loss = torch.relu(y.abs() - 0.9 * float(y_clip)).mean()
+        else:
+            latent_range_loss = mse.new_zeros(())
+        if self.z_range_weight > 0 and z is not None and z_clip is not None and z_clip > 0:
+            z_range_loss = torch.relu(z.abs() - 0.9 * float(z_clip)).mean()
+        else:
+            z_range_loss = mse.new_zeros(())
+        quant_step = output.get("quant_step")
+        y_for_symbol = output.get("y_for_hyper", y)
+        if self.symbol_range_weight > 0 and y_for_symbol is not None and quant_step is not None:
+            step = torch.as_tensor(quant_step, device=y_for_symbol.device, dtype=y_for_symbol.dtype)
+            symbol_proxy = y_for_symbol / step.clamp_min(1e-9)
+            symbol_range_loss = torch.relu(symbol_proxy.abs() - 127.0).mean()
+        else:
+            symbol_range_loss = mse.new_zeros(())
+        if self.scale_range_weight > 0 and scales_y is not None:
+            scale_min_value = float(output.get("scale_min_value", 1e-3))
+            scale_max_value = float(output.get("scale_max_value", 20.0))
+            scale_range_loss = (
+                torch.relu(scales_y - scale_max_value).mean()
+                + torch.relu(scale_min_value - scales_y).mean()
+            )
+        else:
+            scale_range_loss = mse.new_zeros(())
+
         loss = (
             distortion
             + self.rate_weight * rate_loss
@@ -790,11 +1121,18 @@ class RateDistortionLoss(nn.Module):
             + self.highlight_weight * highlight_loss
             + self.l1_weight * l1_loss
             + self.lpips_weight * lpips_loss
+            + self.latent_range_weight * latent_range_loss
+            + self.z_range_weight * z_range_loss
+            + self.symbol_range_weight * symbol_range_loss
+            + self.scale_range_weight * scale_range_loss
         )
-        return {
+        result = {
             "loss": loss,
             "mse": mse,
             "bpp": bpp,
+            "bpp_y": bpp_y,
+            "bpp_z": bpp_z,
+            "bpp_total": bpp_total,
             "bpp_per_image": bpp_per_image,
             "rate_loss": rate_loss,
             "ssim": ssim,
@@ -807,7 +1145,23 @@ class RateDistortionLoss(nn.Module):
             "highlight_contrast": highlight_contrast,
             "l1_loss": l1_loss,
             "lpips_loss": lpips_loss,
+            "latent_range_loss": latent_range_loss,
+            "z_range_loss": z_range_loss,
+            "symbol_range_loss": symbol_range_loss,
+            "scale_range_loss": scale_range_loss,
         }
+        result.update(tensor_stats(y, "latent_y", clip=y_clip))
+        result.update(tensor_stats(z, "latent_z", clip=z_clip))
+        result.update(scale_stats(scales_y))
+        result.update(symbol_stats(symbol_y, "symbol_y"))
+        result.update(symbol_stats(symbol_z, "symbol_z"))
+        fake_quant_errors = output.get("fake_quant_errors", {})
+        if not isinstance(fake_quant_errors, dict):
+            fake_quant_errors = {}
+        result["fake_quant_y_error"] = fake_quant_errors.get("y", mse.new_zeros(()))
+        result["fake_quant_z_error"] = fake_quant_errors.get("z", mse.new_zeros(()))
+        result["fake_quant_scale_error"] = fake_quant_errors.get("scale", mse.new_zeros(()))
+        return result
 
 
 def load_checkpoint(
@@ -818,6 +1172,7 @@ def load_checkpoint(
 ) -> CheckpointState:
     raw = torch.load(path, map_location="cpu")
     state_dict = raw.get("state_dict", raw) if isinstance(raw, dict) else raw
+    model_variant = infer_model_variant_from_checkpoint(raw)
     model.load_state_dict(state_dict, strict=False)
     if optimizer is not None and isinstance(raw, dict) and "optimizer" in raw:
         optimizer.load_state_dict(raw["optimizer"])
@@ -827,17 +1182,51 @@ def load_checkpoint(
         return CheckpointState(
             epoch=int(raw.get("epoch", 0)),
             global_step=int(raw.get("global_step", 0)),
+            model_variant=model_variant,
         )
-    return CheckpointState(epoch=0, global_step=0)
+    return CheckpointState(epoch=0, global_step=0, model_variant=model_variant)
 
 
 @torch.no_grad()
-def set_quant_step(model: FactorizedPriorNano, quant_step: float | None) -> None:
+def set_quant_step(model: nn.Module, quant_step: float | None) -> None:
     if quant_step is None:
         return
     if quant_step <= 0:
         raise ValueError(f"quant_step must be positive, got {quant_step}")
-    model.entropy_bottleneck.quant_step.fill_(float(quant_step))
+    if hasattr(model, "set_quant_step"):
+        model.set_quant_step(float(quant_step))
+    elif hasattr(model, "entropy_bottleneck"):
+        model.entropy_bottleneck.quant_step.fill_(float(quant_step))
+    else:
+        raise AttributeError("model does not expose set_quant_step or entropy_bottleneck")
+
+
+def get_model_quant_step(model: nn.Module) -> float:
+    model = unwrap_model(model)
+    if hasattr(model, "get_quant_step"):
+        return float(model.get_quant_step())
+    return float(model.entropy_bottleneck.quant_step.detach().cpu())
+
+
+def checkpoint_model_variant(path: Path | None) -> str | None:
+    if path is None:
+        return None
+    raw = torch.load(path, map_location="cpu")
+    return infer_model_variant_from_checkpoint(raw)
+
+
+def make_qat_settings(args: argparse.Namespace) -> QATSettings:
+    return QATSettings(
+        enable_latent_fake_quant=bool(args.enable_latent_fake_quant),
+        latent_fake_quant_bits=int(args.latent_fake_quant_bits),
+        latent_fake_quant_clip=float(args.latent_fake_quant_clip),
+        enable_z_fake_quant=bool(args.enable_z_fake_quant),
+        z_fake_quant_bits=int(args.z_fake_quant_bits),
+        z_fake_quant_clip=float(args.z_fake_quant_clip),
+        enable_scale_fake_quant=bool(args.enable_scale_fake_quant),
+        scale_fake_quant_bits=int(args.scale_fake_quant_bits),
+        scale_fake_quant_clip=float(args.scale_fake_quant_clip),
+    )
 
 
 def save_checkpoint(
@@ -851,9 +1240,17 @@ def save_checkpoint(
     metrics: dict[str, float],
 ) -> None:
     model = unwrap_model(model)
+    model_variant = getattr(model, "model_variant", MODEL_VARIANT_NANO)
+    model_config = (
+        model.model_config_dict()
+        if hasattr(model, "model_config_dict")
+        else model_config_to_dict(MODEL_CONFIGS[MODEL_VARIANT_NANO])
+    )
     payload = {
         "epoch": epoch,
         "global_step": global_step,
+        "model_variant": model_variant,
+        "model_config": model_config,
         "quality_profile": args.quality_profile,
         "lambda": args.lmbda,
         "rate_weight": args.rate_weight,
@@ -869,7 +1266,20 @@ def save_checkpoint(
         "l1_weight": args.l1_weight,
         "lpips_weight": args.lpips_weight,
         "lpips_net": args.lpips_net,
-        "quant_step": float(model.entropy_bottleneck.quant_step.detach().cpu()),
+        "quant_step": get_model_quant_step(model),
+        "enable_latent_fake_quant": args.enable_latent_fake_quant,
+        "latent_fake_quant_bits": args.latent_fake_quant_bits,
+        "latent_fake_quant_clip": args.latent_fake_quant_clip,
+        "enable_z_fake_quant": args.enable_z_fake_quant,
+        "z_fake_quant_bits": args.z_fake_quant_bits,
+        "z_fake_quant_clip": args.z_fake_quant_clip,
+        "enable_scale_fake_quant": args.enable_scale_fake_quant,
+        "scale_fake_quant_bits": args.scale_fake_quant_bits,
+        "scale_fake_quant_clip": args.scale_fake_quant_clip,
+        "latent_range_weight": args.latent_range_weight,
+        "z_range_weight": args.z_range_weight,
+        "symbol_range_weight": args.symbol_range_weight,
+        "scale_range_weight": args.scale_range_weight,
         "encoder_activation": args.encoder_activation,
         "decoder_activation": args.decoder_activation,
         "state_dict": model.state_dict(),
@@ -946,6 +1356,24 @@ def format_detail_metrics(
                 f"bpp_std={metrics[key('bpp_std')]:.3f}",
             ]
         )
+    if metrics.get(key("bpp_z"), 0.0) > 0.0:
+        parts.extend(
+            [
+                f"bpp_y={metrics[key('bpp_y')]:.3f}",
+                f"bpp_z={metrics[key('bpp_z')]:.3f}",
+            ]
+        )
+    if key("latent_y_p99") in metrics and metrics.get(key("latent_y_p99"), 0.0) != 0.0:
+        parts.extend(
+            [
+                f"y_p99={metrics[key('latent_y_p99')]:.2f}",
+                f"sym_y_p99={metrics[key('symbol_y_p99_abs')]:.1f}",
+            ]
+        )
+    if metrics.get(key("scale_mean"), 0.0) > 0.0:
+        parts.append(f"scale_mean={metrics[key('scale_mean')]:.3f}")
+    if metrics.get(key("fake_quant_y_error"), 0.0) > 0.0:
+        parts.append(f"fq_y={metrics[key('fake_quant_y_error')]:.5f}")
     if include_lpips or metrics.get(key("lpips_loss"), 0.0) > 0.0:
         parts.append(f"lpips={metrics[key('lpips_loss')]:.5f}")
     skipped_key = key("skipped_batches")
@@ -997,14 +1425,14 @@ def print_run_config(
     train_dataset: ImageFolderDataset,
     train_loader: DataLoader,
     val_loader: DataLoader | None,
-    model: FactorizedPriorNano,
+    model: nn.Module,
     optimizer: torch.optim.Optimizer,
     amp_enabled: bool,
     global_step: int,
     distributed: DistributedContext,
 ) -> None:
     model = unwrap_model(model)
-    quant_step = float(model.entropy_bottleneck.quant_step.detach().cpu())
+    quant_step = get_model_quant_step(model)
     val_text = "none" if val_loader is None else str(len(val_loader.dataset))
     global_batch = args.batch_size * distributed.world_size
     lpips_text = "off"
@@ -1022,7 +1450,8 @@ def print_run_config(
             f"rank={distributed.rank} local_rank={distributed.local_rank}"
         )
     print(
-        f"  objective: profile={args.quality_profile} lambda={args.lmbda:g} "
+        f"  objective: profile={args.quality_profile} model_variant={args.model_variant} "
+        f"lambda={args.lmbda:g} "
         f"target_bpp={args.target_bpp} rate={args.rate_weight:g} "
         f"ssim={args.ssim_weight:g} grad={args.detail_weight:g} "
         f"highlight={args.highlight_weight:g} under={args.highlight_under_weight:g} "
@@ -1030,6 +1459,15 @@ def print_run_config(
         f"texture_contrast={args.texture_contrast_weight:g} l1={args.l1_weight:g} "
         f"lpips={lpips_text} quant_step={quant_step:g}"
     )
+    if args.model_variant == MODEL_VARIANT_HYPER_RESIDUAL_Q:
+        print(
+            "  qat: "
+            f"latent={args.enable_latent_fake_quant}/{args.latent_fake_quant_bits}b "
+            f"z={args.enable_z_fake_quant}/{args.z_fake_quant_bits}b "
+            f"scale={args.enable_scale_fake_quant}/{args.scale_fake_quant_bits}b "
+            f"range_w=({args.latent_range_weight:g}, {args.z_range_weight:g}, "
+            f"{args.symbol_range_weight:g}, {args.scale_range_weight:g})"
+        )
     print(
         f"  schedule: epochs={args.epochs} max_steps={args.max_steps} "
         f"steps/epoch={len(train_loader)} start_step={global_step} "
@@ -1078,21 +1516,7 @@ def train_one_epoch(
     distributed: DistributedContext,
 ) -> tuple[dict[str, float], int, bool]:
     model.train()
-    totals = {
-        "loss": 0.0,
-        "mse": 0.0,
-        "bpp": 0.0,
-        "rate_loss": 0.0,
-        "ssim": 0.0,
-        "detail_loss": 0.0,
-        "highlight_loss": 0.0,
-        "highlight_under_loss": 0.0,
-        "peak_under": 0.0,
-        "highlight_lap": 0.0,
-        "highlight_contrast": 0.0,
-        "l1_loss": 0.0,
-        "lpips_loss": 0.0,
-    }
+    totals = make_metric_totals()
     interval_totals = {key: 0.0 for key in totals}
     bpp_stats = RunningBppStats()
     interval_bpp_stats = RunningBppStats()
@@ -1222,21 +1646,7 @@ def evaluate_loss(
     distributed: DistributedContext = DistributedContext(enabled=False),
 ) -> dict[str, float]:
     model.eval()
-    totals = {
-        "loss": 0.0,
-        "mse": 0.0,
-        "bpp": 0.0,
-        "rate_loss": 0.0,
-        "ssim": 0.0,
-        "detail_loss": 0.0,
-        "highlight_loss": 0.0,
-        "highlight_under_loss": 0.0,
-        "peak_under": 0.0,
-        "highlight_lap": 0.0,
-        "highlight_contrast": 0.0,
-        "l1_loss": 0.0,
-        "lpips_loss": 0.0,
-    }
+    totals = make_metric_totals()
     bpp_stats = RunningBppStats()
     processed_samples = 0
     skipped_batches = 0
@@ -1290,6 +1700,12 @@ def parse_args() -> argparse.Namespace:
         choices=tuple(TRAIN_PROFILES.keys()),
         default="balanced",
         help="Training preset. detail is the high-precision preset for bright highlights, lines, and texture.",
+    )
+    parser.add_argument(
+        "--model-variant",
+        choices=tuple(MODEL_CONFIGS.keys()),
+        default=None,
+        help="Model family. Defaults to nano unless the profile or checkpoint selects another variant.",
     )
     parser.add_argument("--train-dir", type=Path, required=True)
     parser.add_argument("--val-dir", type=Path, default=None)
@@ -1437,8 +1853,33 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--encoder-activation", choices=("relu", "leaky_relu"), default="relu")
+    parser.add_argument("--encoder-activation", choices=("relu", "relu6", "leaky_relu"), default=None)
     parser.add_argument("--decoder-activation", choices=("relu", "leaky_relu"), default="leaky_relu")
+    parser.add_argument(
+        "--enable-latent-fake-quant",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument("--latent-fake-quant-bits", type=int, choices=(8, 16), default=None)
+    parser.add_argument("--latent-fake-quant-clip", type=float, default=None)
+    parser.add_argument(
+        "--enable-z-fake-quant",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument("--z-fake-quant-bits", type=int, choices=(8, 16), default=None)
+    parser.add_argument("--z-fake-quant-clip", type=float, default=None)
+    parser.add_argument(
+        "--enable-scale-fake-quant",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument("--scale-fake-quant-bits", type=int, choices=(8, 16), default=None)
+    parser.add_argument("--scale-fake-quant-clip", type=float, default=None)
+    parser.add_argument("--latent-range-weight", type=float, default=None)
+    parser.add_argument("--z-range-weight", type=float, default=None)
+    parser.add_argument("--symbol-range-weight", type=float, default=None)
+    parser.add_argument("--scale-range-weight", type=float, default=None)
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--local-rank",
@@ -1465,6 +1906,36 @@ def apply_quality_profile(args: argparse.Namespace) -> None:
     if legacy_highlight_under_weight is not None:
         args.highlight_under_weight = legacy_highlight_under_weight
     args.highlight_peak_under_weight = args.highlight_under_weight
+
+    checkpoint_path = args.resume or args.init_checkpoint
+    checkpoint_variant = checkpoint_model_variant(checkpoint_path)
+    if args.model_variant is None and checkpoint_variant is not None:
+        args.model_variant = checkpoint_variant
+    if args.model_variant is None:
+        args.model_variant = MODEL_VARIANT_NANO
+    args.model_variant = normalize_model_variant(args.model_variant)
+
+    config = MODEL_CONFIGS[args.model_variant]
+    if args.encoder_activation is None:
+        args.encoder_activation = config.activation
+    default_qat = {
+        "enable_latent_fake_quant": False,
+        "latent_fake_quant_bits": 8,
+        "latent_fake_quant_clip": 6.0,
+        "enable_z_fake_quant": False,
+        "z_fake_quant_bits": 8,
+        "z_fake_quant_clip": 6.0,
+        "enable_scale_fake_quant": False,
+        "scale_fake_quant_bits": 8,
+        "scale_fake_quant_clip": 8.0,
+        "latent_range_weight": 0.0,
+        "z_range_weight": 0.0,
+        "symbol_range_weight": 0.0,
+        "scale_range_weight": 0.0,
+    }
+    for key, value in default_qat.items():
+        if getattr(args, key) is None:
+            setattr(args, key, value)
 
     if args.init_checkpoint is not None and args.resume is not None:
         raise ValueError("--init-checkpoint and --resume are mutually exclusive")
@@ -1498,6 +1969,21 @@ def apply_quality_profile(args: argparse.Namespace) -> None:
         raise ValueError("--lpips-weight must be non-negative")
     if args.quant_step is not None and args.quant_step <= 0:
         raise ValueError("--quant-step must be positive")
+    for key in (
+        "latent_fake_quant_clip",
+        "z_fake_quant_clip",
+        "scale_fake_quant_clip",
+    ):
+        if getattr(args, key) <= 0:
+            raise ValueError(f"--{key.replace('_', '-')} must be positive")
+    for key in (
+        "latent_range_weight",
+        "z_range_weight",
+        "symbol_range_weight",
+        "scale_range_weight",
+    ):
+        if getattr(args, key) < 0:
+            raise ValueError(f"--{key.replace('_', '-')} must be non-negative")
 
 
 def main() -> None:
@@ -1569,9 +2055,11 @@ def main() -> None:
                 drop_last=False,
             )
 
-        base_model = FactorizedPriorNano(
+        base_model = get_model(
+            model_variant=args.model_variant,
             activation=args.encoder_activation,
             decoder_activation=args.decoder_activation,
+            qat=make_qat_settings(args),
         ).to(device)
         set_quant_step(base_model, args.quant_step)
         criterion = RateDistortionLoss(
@@ -1588,6 +2076,10 @@ def main() -> None:
             l1_weight=args.l1_weight,
             lpips_weight=args.lpips_weight,
             lpips_net=args.lpips_net,
+            latent_range_weight=args.latent_range_weight,
+            z_range_weight=args.z_range_weight,
+            symbol_range_weight=args.symbol_range_weight,
+            scale_range_weight=args.scale_range_weight,
         ).to(device)
 
         model: nn.Module = base_model

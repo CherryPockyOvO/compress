@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 
-from compressai_nano import FactorizedPriorNano
+from compressai_nano import get_model, infer_model_variant_from_checkpoint
 from compressai_nano.cnz import build_cnz_bytes, quantize_latent, write_cnz_file
 from decode_cnz import crop_to_size, tensor_to_image
 from encode_image import image_to_tensor, load_checkpoint, pad_to_multiple
@@ -38,7 +38,7 @@ def default_output_dir(checkpoint: Path, image: Path) -> Path:
 
 
 def encode_decode_image(
-    model: FactorizedPriorNano,
+    model: torch.nn.Module,
     image_path: Path,
     cnz_path: Path,
     recon_path: Path,
@@ -133,8 +133,15 @@ def main() -> None:
     else:
         print("device: cpu")
 
-    model = FactorizedPriorNano().to(device).eval()
+    raw = torch.load(args.checkpoint, map_location="cpu")
+    model_variant = infer_model_variant_from_checkpoint(raw)
+    model = get_model(model_variant=model_variant).to(device).eval()
     load_checkpoint(model, args.checkpoint)
+    if not getattr(model, "supports_cnz_v4", False):
+        raise RuntimeError(
+            f"{model_variant} is a hyperprior model and needs CNZ5 support before "
+            "roundtrip_image.py can encode/decode it."
+        )
 
     stats = encode_decode_image(
         model=model,

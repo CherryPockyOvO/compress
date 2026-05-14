@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from compressai_nano import FactorizedPriorNano
+from compressai_nano import get_model, infer_model_variant_from_checkpoint
 from compressai_nano.cnz import build_cnz_bytes, quantize_latent, write_cnz_file
 
 
@@ -52,8 +52,16 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
-    model = FactorizedPriorNano().to(device).eval()
+    raw = torch.load(args.checkpoint, map_location="cpu")
+    model_variant = infer_model_variant_from_checkpoint(raw)
+    model = get_model(model_variant=model_variant).to(device).eval()
     load_checkpoint(model, args.checkpoint)
+    if not getattr(model, "supports_cnz_v4", False):
+        raise RuntimeError(
+            f"{model_variant} uses a scale hyperprior and cannot be encoded as CNZ4 yet. "
+            "Use tools/export_encoder_onnx.py for analysis-side export, or add CNZ5 "
+            "support with z/y streams before deployment."
+        )
 
     x = image_to_tensor(args.image).to(device)
     x_padded, original_size = pad_to_multiple(x, model.downsampling_factor)
@@ -82,7 +90,7 @@ def main() -> None:
     pixels = original_size[0] * original_size[1]
     latent_payload_bits = int(stats["payload_size"]) * 8
     container_bits = args.output.stat().st_size * 8
-    print("model=single high-quality configuration")
+    print(f"model_variant={model_variant}")
     print(f"original_size={original_size}")
     print(f"latent_shape={tuple(int(v) for v in symbols.shape)}")
     print(f"dtype={stats['dtype']}")

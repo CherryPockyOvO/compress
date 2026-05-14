@@ -173,9 +173,9 @@ def load_decoder_modules() -> Tuple[Any, Any, Any]:
     import torch
 
     import decode_cnz as cnz_decoder
-    from compressai_nano import FactorizedPriorNano
+    from compressai_nano import get_model
 
-    return torch, cnz_decoder, FactorizedPriorNano
+    return torch, cnz_decoder, get_model
 
 
 def setup_model(
@@ -205,7 +205,14 @@ def setup_model(
     else:
         print("device: cpu")
 
-    model = model_cls().to(device).eval()
+    raw = torch.load(args.checkpoint, map_location="cpu")
+    model_variant = cnz_decoder.infer_model_variant_from_checkpoint(raw)
+    model = model_cls(model_variant=model_variant).to(device).eval()
+    if not getattr(model, "supports_cnz_v4", False):
+        raise RuntimeError(
+            f"{model_variant} cannot decode CNZ4 video streams. Add CNZ5 hyperprior "
+            "bitstream support before using pc_decode_cnz_video.py with this checkpoint."
+        )
     if device.type == "cuda" and args.channels_last:
         model = model.to(memory_format=torch.channels_last)
     if args.half:

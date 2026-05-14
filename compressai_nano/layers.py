@@ -42,6 +42,8 @@ def make_activation(name: str = "relu", inplace: bool = True) -> nn.Module:
     name = name.lower()
     if name == "relu":
         return nn.ReLU(inplace=inplace)
+    if name == "relu6":
+        return nn.ReLU6(inplace=inplace)
     if name in {"leaky_relu", "leaky-relu", "lrelu"}:
         return nn.LeakyReLU(negative_slope=0.1, inplace=inplace)
     raise ValueError(f"Unsupported activation: {name}")

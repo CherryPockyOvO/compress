@@ -54,6 +54,13 @@ The single retained configuration uses `N=128, M=128`, `quant_step=0.67`,
 Old lower-quality checkpoints are not useful for this code path. Old level-3
 checkpoints can still be loaded manually with `--resume` or `--checkpoint`.
 
+An experimental high-precision variant is available as
+`nano_hyper_residual_q`. It adds a quantization-friendly residual encoder,
+scale-only hyperprior, ReLU6, latent/z/scale clipping, and optional QAT fake
+quant for RKNN mixed precision experiments. It is not the default and does not
+replace the existing `nano` CNZ4 path. See
+[`docs/nano_hyper_residual_q.md`](docs/nano_hyper_residual_q.md).
+
 ## Export Encoder ONNX
 
 From this directory:

@@ -14,7 +14,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from compressai_nano import FactorizedPriorNano
+from compressai_nano import get_model, infer_model_variant_from_checkpoint
 from compressai_nano.cnz import MAGIC, cnz_to_y_hat, read_cnz_file
 
 
@@ -105,7 +105,7 @@ def load_checkpoint(model: torch.nn.Module, checkpoint: Path) -> None:
 
 def legacy_pickle_payload_to_y_hat(
     package: dict[str, Any],
-    model: FactorizedPriorNano,
+    model: torch.nn.Module,
     device: torch.device,
 ) -> torch.Tensor:
     strings = package["strings"]
@@ -137,7 +137,7 @@ def legacy_pickle_payload_to_y_hat(
 
 def decode_cnz(
     path: Path,
-    model: FactorizedPriorNano,
+    model: torch.nn.Module,
     device: torch.device,
     use_half: bool,
 ) -> tuple[torch.Tensor, tuple[int, int]]:
@@ -162,7 +162,7 @@ def decode_cnz(
 
 def decode_legacy(
     path: Path,
-    model: FactorizedPriorNano,
+    model: torch.nn.Module,
     device: torch.device,
 ) -> tuple[torch.Tensor, tuple[int, int]]:
     package = pickle.loads(path.read_bytes())
@@ -260,7 +260,14 @@ def main() -> None:
     else:
         print("device: cpu")
 
-    model = FactorizedPriorNano().to(device).eval()
+    raw = torch.load(args.checkpoint, map_location="cpu")
+    model_variant = infer_model_variant_from_checkpoint(raw)
+    model = get_model(model_variant=model_variant).to(device).eval()
+    if not getattr(model, "supports_cnz_v4", False):
+        raise RuntimeError(
+            f"{model_variant} cannot decode existing CNZ4 streams. Hyperprior deployment "
+            "needs a future CNZ5 format carrying z/y streams and hyperprior metadata."
+        )
 
     if device.type == "cuda" and args.channels_last:
         model = model.to(memory_format=torch.channels_last)

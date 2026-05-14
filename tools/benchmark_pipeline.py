@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from compressai_nano import FactorizedPriorNano
+from compressai_nano import get_model, infer_model_variant_from_checkpoint
 from compressai_nano.cnz import build_cnz_bytes, quantize_latent
 
 
@@ -60,8 +60,15 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
-    model = FactorizedPriorNano().to(device).eval()
+    raw = torch.load(args.checkpoint, map_location="cpu")
+    model_variant = infer_model_variant_from_checkpoint(raw)
+    model = get_model(model_variant=model_variant).to(device).eval()
     load_checkpoint(model, args.checkpoint)
+    if not getattr(model, "supports_cnz_v4", False):
+        raise RuntimeError(
+            f"{model_variant} is not compatible with the CNZ4 benchmark path yet. "
+            "Benchmark its analysis side with tools/export_encoder_onnx.py or add CNZ5."
+        )
     x = image_to_tensor(args.image).to(device)
     x, original_size = pad_to_multiple(x, model.downsampling_factor)
 
