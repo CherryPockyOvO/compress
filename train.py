@@ -45,7 +45,7 @@ TRAIN_PROFILES = {
         "detail_weight": 0.0,
         "highlight_weight": 0.0,
         "highlight_under_weight": 1.0,
-        "highlight_lap_weight": 0.8,    
+        "highlight_lap_weight": 0.8,
         "texture_lap_weight": 1.0,
         "texture_contrast_weight": 0.4,
         "l1_weight": 0.0,
@@ -58,26 +58,6 @@ TRAIN_PROFILES = {
         "lr": 1e-4,
     },
     "detail": {
-        "lmbda": 0.05,
-        "rate_weight": 0.25,
-        "target_bpp": None,
-        "ssim_weight": 0.05,
-        "detail_weight": 1.5,
-        "highlight_weight": 1.0,
-        "highlight_under_weight": 1.0,
-        "highlight_lap_weight": 0.8,
-        "texture_lap_weight": 1.0,
-        "texture_contrast_weight": 0.4,
-        "l1_weight": 0.10,
-        "lpips_weight": 0.003,
-        "lpips_net": "alex",
-        "quant_step": 0.50,
-        "epochs": 80,
-        "batch_size": 32,
-        "crop_size": 384,
-        "lr": 1e-5,
-    },
-    "detail_peak": {
         "lmbda": 0.05,
         "rate_weight": 0.25,
         "target_bpp": None,
@@ -124,40 +104,6 @@ TRAIN_PROFILES = {
         "z_range_weight": 0.0,
         "symbol_range_weight": 0.0,
         "scale_range_weight": 0.0,
-    },
-    "hyper_quality_qat16": {
-        "model_variant": MODEL_VARIANT_HYPER_RESIDUAL_Q,
-        "lmbda": 0.06,
-        "rate_weight": 0.35,
-        "target_bpp": None,
-        "ssim_weight": 0.05,
-        "detail_weight": 1.2,
-        "highlight_weight": 0.8,
-        "highlight_under_weight": 1.0,
-        "highlight_lap_weight": 0.8,
-        "texture_lap_weight": 1.0,
-        "texture_contrast_weight": 0.4,
-        "l1_weight": 0.08,
-        "lpips_weight": 0.002,
-        "lpips_net": "alex",
-        "quant_step": 0.45,
-        "epochs": 40,
-        "batch_size": 24,
-        "crop_size": 384,
-        "lr": 1e-5,
-        "enable_latent_fake_quant": True,
-        "latent_fake_quant_bits": 16,
-        "latent_fake_quant_clip": 6.0,
-        "enable_z_fake_quant": True,
-        "z_fake_quant_bits": 16,
-        "z_fake_quant_clip": 6.0,
-        "enable_scale_fake_quant": True,
-        "scale_fake_quant_bits": 16,
-        "scale_fake_quant_clip": 8.0,
-        "latent_range_weight": 0.01,
-        "z_range_weight": 0.01,
-        "symbol_range_weight": 0.001,
-        "scale_range_weight": 0.001,
     },
     "hyper_quality_qat8": {
         "model_variant": MODEL_VARIANT_HYPER_RESIDUAL_Q,
@@ -591,7 +537,7 @@ class ToTensor:
 
 def make_train_transform(crop_size: int, quality_profile: str = "balanced") -> Compose:
     crop: Callable[[Image.Image], Image.Image]
-    if quality_profile in {"detail", "detail_peak"} or quality_profile.startswith("hyper_quality"):
+    if quality_profile == "detail" or quality_profile.startswith("hyper_quality"):
         crop = DetailAwareRandomCrop(crop_size, p_detail=0.3)
     else:
         crop = RandomCrop(crop_size)
@@ -1699,7 +1645,7 @@ def parse_args() -> argparse.Namespace:
         "--quality-profile",
         choices=tuple(TRAIN_PROFILES.keys()),
         default="balanced",
-        help="Training preset. detail is the high-precision preset for bright highlights, lines, and texture.",
+        help="Training preset. detail is the legacy nano detail preset; hyper_quality_* uses the hyperprior model.",
     )
     parser.add_argument(
         "--model-variant",
@@ -1858,21 +1804,21 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
     )
-    parser.add_argument("--latent-fake-quant-bits", type=int, choices=(8, 16), default=None)
+    parser.add_argument("--latent-fake-quant-bits", type=int, choices=(8,), default=None)
     parser.add_argument("--latent-fake-quant-clip", type=float, default=None)
     parser.add_argument(
         "--enable-z-fake-quant",
         action=argparse.BooleanOptionalAction,
         default=None,
     )
-    parser.add_argument("--z-fake-quant-bits", type=int, choices=(8, 16), default=None)
+    parser.add_argument("--z-fake-quant-bits", type=int, choices=(8,), default=None)
     parser.add_argument("--z-fake-quant-clip", type=float, default=None)
     parser.add_argument(
         "--enable-scale-fake-quant",
         action=argparse.BooleanOptionalAction,
         default=None,
     )
-    parser.add_argument("--scale-fake-quant-bits", type=int, choices=(8, 16), default=None)
+    parser.add_argument("--scale-fake-quant-bits", type=int, choices=(8,), default=None)
     parser.add_argument("--scale-fake-quant-clip", type=float, default=None)
     parser.add_argument("--latent-range-weight", type=float, default=None)
     parser.add_argument("--z-range-weight", type=float, default=None)

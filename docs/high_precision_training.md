@@ -3,12 +3,12 @@
 This document is the operating guide for the current high-precision route:
 `nano_hyper_residual_q`.
 
-This route uses both pieces of the new architecture:
+This route uses:
 
 - a quantization-friendly residual encoder built from
   `DownsampleResidualBlock` and `QuantResidualBlock`;
-- a scale-only hyperprior: `h_a` predicts `z`, `h_s` reconstructs `scales_y`,
-  and `y` is modeled with Gaussian conditional entropy.
+- a scale-only hyperprior where `h_a` predicts `z`, `h_s` reconstructs
+  `scales_y`, and `y` is modeled with Gaussian conditional entropy.
 
 The training path is:
 
@@ -18,25 +18,22 @@ x -> residual g_a -> y
        y + scales_y -> Gaussian conditional entropy -> y_hat -> g_s -> x_hat
 ```
 
-The old `detail` and `detail_peak` profiles are legacy `nano` fine-tuning
-profiles. They do not use hyperprior or the new residual encoder.
+The `detail` profile is the legacy `nano` CNZ4 fine-tuning profile. It does not
+use the hyperprior or the residual encoder.
 
-## Three Precision Stages
+## Precision Stages
 
-The current high-precision route has three stages:
+The current route keeps two precision stages:
 
 ```text
 hyper_quality_fp:
-  full-precision training; fake quant disabled
-
-hyper_quality_qat16:
-  fine-tune from FP; fake quant y/z/scales_y to 16 bits
+  full-precision training; fake quant disabled; export/convert as FP16
 
 hyper_quality_qat8:
-  fine-tune from QAT16; fake quant y/z/scales_y to 8 bits
+  fine-tune from FP; fake quant y/z/scales_y to 8 bits
 ```
 
-All three profiles select:
+Both profiles select:
 
 ```text
 model_variant=nano_hyper_residual_q
@@ -71,18 +68,7 @@ You can also call the tools directly without activating:
 /home/zzw/miniconda3/envs/net/bin/torchrun
 ```
 
-The expected local GPU layout is three RTX 4090 cards:
-
-```bash
-nvidia-smi
-```
-
-The `hyper_quality_*` profiles use LPIPS by default (`lpips_weight=0.002`), so
-the `lpips` package must import in this environment.
-
 ## Stage 1: FP Training
-
-Start here:
 
 ```bash
 cd /home/zzw/workspace/compressai-nano
@@ -101,9 +87,25 @@ CUDA_VISIBLE_DEVICES=0,1,2 /home/zzw/miniconda3/envs/net/bin/torchrun \
   --num-workers 8
 ```
 
-This stage uses full precision for `y`, `z`, and `scales_y`.
+Resume the same FP stage by increasing `--max-steps` and using `--resume`:
 
-## Stage 2: QAT16 Fine-Tuning
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2 /home/zzw/miniconda3/envs/net/bin/torchrun \
+  --standalone \
+  --nproc_per_node=3 \
+  train.py \
+  --quality-profile hyper_quality_fp \
+  --resume checkpoints_hyper_quality_fp/latest.pt \
+  --train-dir data/train \
+  --val-dir data/val \
+  --checkpoint-dir checkpoints_hyper_quality_fp \
+  --checkpoint-interval-steps 100 \
+  --eval-interval-steps 100 \
+  --max-steps 12000 \
+  --num-workers 8
+```
+
+## Stage 2: INT8/QAT8 Fine-Tuning
 
 Run this after stage 1 has produced `checkpoints_hyper_quality_fp/best.pt`:
 
@@ -114,38 +116,8 @@ CUDA_VISIBLE_DEVICES=0,1,2 /home/zzw/miniconda3/envs/net/bin/torchrun \
   --standalone \
   --nproc_per_node=3 \
   train.py \
-  --quality-profile hyper_quality_qat16 \
-  --init-checkpoint checkpoints_hyper_quality_fp/best.pt \
-  --train-dir data/train \
-  --val-dir data/val \
-  --checkpoint-dir checkpoints_hyper_quality_qat16 \
-  --checkpoint-interval-steps 100 \
-  --eval-interval-steps 100 \
-  --max-steps 3000 \
-  --num-workers 8
-```
-
-This enables fake quant for:
-
-```text
-y: 16-bit symmetric fake quant, clip=6.0
-z: 16-bit symmetric fake quant, clip=6.0
-scales_y: 16-bit positive fake quant, clip=8.0
-```
-
-## Stage 3: QAT8 Fine-Tuning
-
-Run this after stage 2 has produced `checkpoints_hyper_quality_qat16/best.pt`:
-
-```bash
-cd /home/zzw/workspace/compressai-nano
-
-CUDA_VISIBLE_DEVICES=0,1,2 /home/zzw/miniconda3/envs/net/bin/torchrun \
-  --standalone \
-  --nproc_per_node=3 \
-  train.py \
   --quality-profile hyper_quality_qat8 \
-  --init-checkpoint checkpoints_hyper_quality_qat16/best.pt \
+  --init-checkpoint checkpoints_hyper_quality_fp/best.pt \
   --train-dir data/train \
   --val-dir data/val \
   --checkpoint-dir checkpoints_hyper_quality_qat8 \
@@ -163,55 +135,78 @@ z: 8-bit symmetric fake quant, clip=6.0
 scales_y: 8-bit positive fake quant, clip=8.0
 ```
 
-## Resume
-
-Use `--resume` only when continuing the same stage, because it restores the
-optimizer, scheduler, epoch, and global step. Example for interrupted stage 1:
-
-```bash
-cd /home/zzw/workspace/compressai-nano
-
-CUDA_VISIBLE_DEVICES=0,1,2 /home/zzw/miniconda3/envs/net/bin/torchrun \
-  --standalone \
-  --nproc_per_node=3 \
-  train.py \
-  --quality-profile hyper_quality_fp \
-  --resume checkpoints_hyper_quality_fp/latest.pt \
-  --train-dir data/train \
-  --val-dir data/val \
-  --checkpoint-dir checkpoints_hyper_quality_fp \
-  --checkpoint-interval-steps 100 \
-  --eval-interval-steps 100 \
-  --max-steps 9000 \
-  --num-workers 8
-```
-
-Increase `--max-steps` beyond the saved `global_step`. If the checkpoint has
-already reached the requested max step, the script exits without training.
-
 ## Batch Size And Steps
 
 In DDP mode, `--batch-size` is per GPU. The `hyper_quality_*` profiles use
 `batch_size=24`, so three GPUs train with a global batch of `72`.
 
 With the current local split of about 40001 train images, one epoch is about
-556 optimizer steps. The suggested starts are:
+556 optimizer steps:
 
 ```text
-hyper_quality_fp:    8000 steps, about 14.4 epochs
-hyper_quality_qat16: 3000 steps, about 5.4 epochs
-hyper_quality_qat8:  2000 steps, about 3.6 epochs
+hyper_quality_fp:   8000 steps, about 14.4 epochs
+hyper_quality_qat8: 2000 steps, about 3.6 epochs
 ```
 
-If memory is tight:
+## Encoder Complexity
+
+The complexity tool counts Conv/Deconv parameters and FLOPs. FLOPs are reported
+as `2 * MACs`. FP16 and INT8 have the same parameter count and FLOPs; their
+weight storage differs.
+
+For the legacy `nano` model used by `balanced` and `detail`, the encoder is the
+same network for both profiles. The checkpoint changes quality/rate behavior,
+but not encoder parameter count or FLOPs.
 
 ```bash
---batch-size 16
+/home/zzw/miniconda3/envs/net/bin/python tools/encoder_complexity.py \
+  --model-variant nano \
+  --height 720 \
+  --width 1280 \
+  --mode both
 ```
 
-If data loading is the bottleneck, try `--num-workers 10` or `--num-workers 12`.
-The value is per rank, so `--num-workers 8` starts 24 loader workers across
-three ranks.
+Current legacy `nano` result at `720x1280`:
+
+```text
+encoder_y / analysis_y_only:
+  params: 1,238,912
+  FP16 param size: 2.363 MiB
+  INT8 param size: 1.182 MiB
+  MACs: 33.178 GMACs
+  FLOPs: 66.355 GFLOPs
+```
+
+For 720p content the hyperprior analysis path should be padded to `768x1280`
+so `y` and `scales_y` have matching spatial shapes.
+
+```bash
+/home/zzw/miniconda3/envs/net/bin/python tools/encoder_complexity.py \
+  --height 768 \
+  --width 1280 \
+  --mode both
+```
+
+Current result:
+
+```text
+encoder_y:
+  params: 2,096,224
+  FP16 param size: 3.998 MiB
+  INT8 param size: 1.999 MiB
+  MACs: 157.888 GMACs
+  FLOPs: 315.776 GFLOPs
+
+analysis_y_z_scales:
+  params: 2,981,728
+  FP16 param size: 5.687 MiB
+  INT8 param size: 2.844 MiB
+  MACs: 159.640 GMACs
+  FLOPs: 319.280 GFLOPs
+```
+
+`encoder_y` is `image -> y`. `analysis_y_z_scales` is
+`image -> (y, z, scales_y)`.
 
 ## Metrics To Watch
 
@@ -248,26 +243,32 @@ val_highlight_contrast
 val_lpips_loss
 ```
 
-## Export After Training
+## Export
 
-Export only `image -> y`:
+Export the FP checkpoint for FP16/RKNN-FP16 conversion:
 
 ```bash
 /home/zzw/miniconda3/envs/net/bin/python tools/export_encoder_onnx.py \
-  --checkpoint checkpoints_hyper_quality_qat8/best.pt \
-  --output encoder_hyper_y.onnx \
-  --height 720 \
+  --checkpoint checkpoints_hyper_quality_fp/best.pt \
+  --output encoder_hyper_fp16_y.onnx \
+  --height 768 \
   --width 1280
 ```
 
-Export analysis side `image -> y, z, scales_y`:
+Export the INT8/QAT8 checkpoint:
 
 ```bash
 /home/zzw/miniconda3/envs/net/bin/python tools/export_encoder_onnx.py \
   --checkpoint checkpoints_hyper_quality_qat8/best.pt \
-  --output analysis_hyper.onnx \
+  --output encoder_hyper_int8_y.onnx \
+  --height 768 \
+  --width 1280
+
+/home/zzw/miniconda3/envs/net/bin/python tools/export_encoder_onnx.py \
+  --checkpoint checkpoints_hyper_quality_qat8/best.pt \
+  --output analysis_hyper_int8.onnx \
   --export-mode analysis \
-  --height 720 \
+  --height 768 \
   --width 1280
 ```
 
@@ -290,12 +291,5 @@ before CNZ5 exists:
   --timing
 ```
 
-This runs:
-
-```text
-image -> residual encoder -> y/z/scales_y -> y_hat -> decoder -> recon.png
-```
-
-It also prints `bpp_y`, `bpp_z`, `estimated_bpp`, and the shapes of `y`, `z`,
-and `scales_y`. This is not a real bitstream roundtrip; `--mode cnz4` is only
-for old `nano` checkpoints that support CNZ4.
+This is not a real bitstream roundtrip; `--mode cnz4` is only for old `nano`
+checkpoints that support CNZ4.

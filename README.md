@@ -58,9 +58,10 @@ The current high-precision training route is `nano_hyper_residual_q`. It adds a
 quantization-friendly residual encoder, scale-only hyperprior, ReLU6,
 latent/z/scale clipping, and staged QAT fake quant for RKNN mixed precision
 experiments. The three precision stages are `hyper_quality_fp`,
-`hyper_quality_qat16`, and `hyper_quality_qat8`. This route does not decode the
-old `nano` CNZ4 bitstream; CNZ5 support is still needed for full hyperprior
-deployment. See
+and `hyper_quality_qat8`. `hyper_quality_fp` is the FP training route that can
+be exported/converted as FP16, and `hyper_quality_qat8` is the INT8 fake-quant
+route. This route does not decode the old `nano` CNZ4 bitstream; CNZ5 support
+is still needed for full hyperprior deployment. See
 [`docs/nano_hyper_residual_q.md`](docs/nano_hyper_residual_q.md).
 
 ## Export Encoder ONNX
@@ -156,9 +157,9 @@ x -> residual g_a -> y
        y + scales_y -> Gaussian conditional entropy -> y_hat -> g_s -> x_hat
 ```
 
-This is different from the legacy `detail/detail_peak` route. `detail` and
-`detail_peak` keep the old `nano` factorized-prior shape and CNZ4 path; they do
-not use the new residual encoder or hyperprior.
+This is different from the legacy `detail` route. `detail` keeps the old
+`nano` factorized-prior shape and CNZ4 path; it does not use the new residual
+encoder or hyperprior.
 
 The full runbook is in
 [`docs/high_precision_training.md`](docs/high_precision_training.md). On this
@@ -175,12 +176,12 @@ or call the environment tools directly:
 /home/zzw/miniconda3/envs/net/bin/torchrun
 ```
 
-The current three precision stages are:
+The current precision route has two stages:
 
-1. `hyper_quality_fp`: full-precision baseline training, no fake quant.
-2. `hyper_quality_qat16`: 16-bit fake quant fine-tuning for `y`, `z`, and
+1. `hyper_quality_fp`: full-precision baseline training, no fake quant. Export
+   this checkpoint for FP16/RKNN-FP16 experiments.
+2. `hyper_quality_qat8`: 8-bit fake quant fine-tuning for `y`, `z`, and
    `scales_y`.
-3. `hyper_quality_qat8`: 8-bit fake quant fine-tuning for the same tensors.
 
 Start stage 1 from scratch. Do not initialize from `checkpoints_detail/*.pt`,
 because the old `nano` model uses `M=128` factorized latents while
@@ -201,25 +202,7 @@ CUDA_VISIBLE_DEVICES=0,1,2 /home/zzw/miniconda3/envs/net/bin/torchrun \
   --num-workers 8
 ```
 
-After stage 1, continue with QAT16:
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2 /home/zzw/miniconda3/envs/net/bin/torchrun \
-  --standalone \
-  --nproc_per_node=3 \
-  train.py \
-  --quality-profile hyper_quality_qat16 \
-  --init-checkpoint checkpoints_hyper_quality_fp/best.pt \
-  --train-dir data/train \
-  --val-dir data/val \
-  --checkpoint-dir checkpoints_hyper_quality_qat16 \
-  --checkpoint-interval-steps 100 \
-  --eval-interval-steps 100 \
-  --max-steps 3000 \
-  --num-workers 8
-```
-
-Then continue with QAT8:
+After stage 1, continue directly with INT8/QAT8:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2 /home/zzw/miniconda3/envs/net/bin/torchrun \
@@ -227,7 +210,7 @@ CUDA_VISIBLE_DEVICES=0,1,2 /home/zzw/miniconda3/envs/net/bin/torchrun \
   --nproc_per_node=3 \
   train.py \
   --quality-profile hyper_quality_qat8 \
-  --init-checkpoint checkpoints_hyper_quality_qat16/best.pt \
+  --init-checkpoint checkpoints_hyper_quality_fp/best.pt \
   --train-dir data/train \
   --val-dir data/val \
   --checkpoint-dir checkpoints_hyper_quality_qat8 \
@@ -243,11 +226,27 @@ With the current local split of about 40001 train images, one epoch is about
 556 optimizer steps. Only rank 0 prints progress and writes `eN.pt`,
 `latest.pt`, and `best.pt`.
 
+Encoder-side complexity for a 720p frame padded to `768x1280`:
+
+```text
+encoder_y:        2,096,224 params, 157.888 GMACs, 315.776 GFLOPs
+analysis_y_z_s:   2,981,728 params, 159.640 GMACs, 319.280 GFLOPs
+FP16 param size:  3.998 MiB encoder_y, 5.687 MiB analysis
+INT8 param size:  1.999 MiB encoder_y, 2.844 MiB analysis
+```
+
+Recalculate with:
+
+```bash
+/home/zzw/miniconda3/envs/net/bin/python tools/encoder_complexity.py --height 768 --width 1280 --mode both
+```
+
 Export the high-precision analysis model after training:
 
 ```bash
-/home/zzw/miniconda3/envs/net/bin/python tools/export_encoder_onnx.py --checkpoint checkpoints_hyper_quality_qat8/best.pt --output encoder_hyper_y.onnx --height 720 --width 1280
-/home/zzw/miniconda3/envs/net/bin/python tools/export_encoder_onnx.py --checkpoint checkpoints_hyper_quality_qat8/best.pt --output analysis_hyper.onnx --export-mode analysis --height 720 --width 1280
+/home/zzw/miniconda3/envs/net/bin/python tools/export_encoder_onnx.py --checkpoint checkpoints_hyper_quality_fp/best.pt --output encoder_hyper_fp16_y.onnx --height 768 --width 1280
+/home/zzw/miniconda3/envs/net/bin/python tools/export_encoder_onnx.py --checkpoint checkpoints_hyper_quality_qat8/best.pt --output encoder_hyper_int8_y.onnx --height 768 --width 1280
+/home/zzw/miniconda3/envs/net/bin/python tools/export_encoder_onnx.py --checkpoint checkpoints_hyper_quality_qat8/best.pt --output analysis_hyper_int8.onnx --export-mode analysis --height 768 --width 1280
 ```
 
 The hyperprior model currently supports training and ONNX/RKNN analysis export.

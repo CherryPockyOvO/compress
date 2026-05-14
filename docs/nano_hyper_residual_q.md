@@ -5,10 +5,10 @@ existing nano codec project. The default model is still `nano`; this variant is
 enabled only with `--model-variant nano_hyper_residual_q` or with one of the
 `hyper_quality_*` training profiles.
 
-For the current three-stage high-precision training route, start with
+For the current high-precision training route, start with
 [`high_precision_training.md`](high_precision_training.md). That runbook trains
-this `nano_hyper_residual_q` model through `hyper_quality_fp`,
-`hyper_quality_qat16`, and `hyper_quality_qat8`.
+this `nano_hyper_residual_q` model through `hyper_quality_fp` and
+`hyper_quality_qat8`.
 
 ## Goals
 
@@ -92,19 +92,19 @@ QAT is disabled by default. The first implementation fake-quantizes only:
 It does not fake-quantize every activation. This keeps FP training stable and
 lets RKNN mixed precision decide which Conv/residual layers should become INT8.
 
-Available flags:
+Available fake-quant flags:
 
 ```text
 --enable-latent-fake-quant
---latent-fake-quant-bits 8|16
+--latent-fake-quant-bits 8
 --latent-fake-quant-clip 6.0
 
 --enable-z-fake-quant
---z-fake-quant-bits 8|16
+--z-fake-quant-bits 8
 --z-fake-quant-clip 6.0
 
 --enable-scale-fake-quant
---scale-fake-quant-bits 8|16
+--scale-fake-quant-bits 8
 --scale-fake-quant-clip 8.0
 ```
 
@@ -133,7 +133,7 @@ entropy coding and reconstruction.
 
 ## Training Flow
 
-Stage 1: FP training
+Stage 1: FP training. Export this checkpoint for FP16/RKNN-FP16 experiments.
 
 ```bash
 python train.py \
@@ -143,34 +143,23 @@ python train.py \
   --checkpoint-dir checkpoints_hyper_quality_fp
 ```
 
-Stage 2: QAT16 fine-tuning
-
-```bash
-python train.py \
-  --quality-profile hyper_quality_qat16 \
-  --train-dir data/train \
-  --val-dir data/val \
-  --init-checkpoint checkpoints_hyper_quality_fp/best.pt \
-  --checkpoint-dir checkpoints_hyper_quality_qat16
-```
-
-Stage 3: QAT8 fine-tuning
+Stage 2: QAT8 fine-tuning
 
 ```bash
 python train.py \
   --quality-profile hyper_quality_qat8 \
   --train-dir data/train \
   --val-dir data/val \
-  --init-checkpoint checkpoints_hyper_quality_qat16/best.pt \
+  --init-checkpoint checkpoints_hyper_quality_fp/best.pt \
   --checkpoint-dir checkpoints_hyper_quality_qat8
 ```
 
-Stage 4: RKNN mixed precision exploration
+Stage 3: RKNN mixed precision exploration
 
 1. Export FP ONNX.
 2. Convert FP RKNN and confirm quality.
-3. Convert full INT8 as a failure/control baseline.
-4. Use RKNN hybrid quantization:
+3. Convert the QAT8/INT8 path as the quantized target.
+4. Use RKNN hybrid quantization where needed:
    - ordinary Conv/residual layers INT8,
    - `y` output FP16,
    - `z` output FP16,
@@ -185,7 +174,7 @@ Export only `image -> y`:
 python tools/export_encoder_onnx.py \
   --checkpoint checkpoints_hyper_quality_qat8/best.pt \
   --output encoder_hyper_y.onnx \
-  --height 720 \
+  --height 768 \
   --width 1280
 ```
 
@@ -196,7 +185,7 @@ python tools/export_encoder_onnx.py \
   --checkpoint checkpoints_hyper_quality_qat8/best.pt \
   --output analysis_hyper.onnx \
   --export-mode analysis \
-  --height 720 \
+  --height 768 \
   --width 1280
 ```
 
