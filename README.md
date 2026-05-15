@@ -62,7 +62,9 @@ mixed precision: main transform INT8/QAT candidates, with the hyperprior
 `z/means/scales` kept FP/FP16. The old `nano_hyper_residual_q` scale-only model
 is retained only as a baseline. This route does not decode the old `nano` CNZ4
 bitstream; CNZ5 support is still needed for full hyperprior deployment. See
-[`docs/nano_hyper_residual_q.md`](docs/nano_hyper_residual_q.md).
+[`docs/nano_hyper_residual_q.md`](docs/nano_hyper_residual_q.md). For the
+RK3588 export and reference compression flow for the new nano mean-scale model,
+see [`docs/rk3588_hyper_ms_nano_deployment.md`](docs/rk3588_hyper_ms_nano_deployment.md).
 
 ## Export Encoder ONNX
 

@@ -24,6 +24,22 @@ class AnalysisExportWrapper(nn.Module):
             y = self.model.encoder(x)
             zeros = y.new_zeros(1)
             return y, zeros, zeros
+        if all(
+            hasattr(self.model, name)
+            for name in ("encoder", "hyper_encoder", "entropy_bottleneck_z", "hyper_decoder")
+        ):
+            y = self.model.encoder(x)
+            z = self.model.hyper_encoder(y)
+            z_symbols = self.model.entropy_bottleneck_z.quantize(z)
+            z_hat = self.model.entropy_bottleneck_z.dequantize(
+                z_symbols,
+                dtype=z.dtype,
+                device=z.device,
+            )
+            hyper = self.model.hyper_decoder(z_hat)
+            if isinstance(hyper, tuple):
+                return (y, z, *hyper)
+            return y, z, hyper
         return self.model.analysis_transform(x)
 
 
@@ -40,7 +56,7 @@ def load_checkpoint(model: torch.nn.Module, checkpoint: Path) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Export only FactorizedPriorNano encoder to ONNX.")
+    parser = argparse.ArgumentParser(description="Export encoder or analysis transform to ONNX.")
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(

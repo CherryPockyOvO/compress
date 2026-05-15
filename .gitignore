@@ -1,7 +1,6 @@
 # 排除權重與日誌
 checkpoints_*/
 *.pt
-!./best.pt
 *.log
 
 # 排除數據與圖片
