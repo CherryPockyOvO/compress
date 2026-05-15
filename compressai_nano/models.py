@@ -14,6 +14,8 @@ from .layers import ConvNormAct, conv, deconv, init_module, make_activation
 
 MODEL_VARIANT_NANO = "nano"
 MODEL_VARIANT_HYPER_RESIDUAL_Q = "nano_hyper_residual_q"
+MODEL_VARIANT_HYPER_MS_Q = "nano_hyper_ms_q"
+MODEL_VARIANT_HYPER_MS_Q_NANO = "nano_hyper_ms_q_nano"
 
 
 @dataclass(frozen=True)
@@ -32,6 +34,7 @@ class ModelConfig:
     encoder_norm: str = "bn"
     Z: int | None = None
     latent_clip: float | None = None
+    signed_latent: bool = False
     z_clip: float | None = None
     scale_min: float = 1e-3
     scale_max: float = 20.0
@@ -68,6 +71,47 @@ MODEL_CONFIGS: dict[str, ModelConfig] = {
         activation="relu6",
         encoder_norm="none",
         latent_clip=6.0,
+        signed_latent=False,
+        z_clip=6.0,
+        scale_min=1e-3,
+        scale_max=20.0,
+    ),
+    MODEL_VARIANT_HYPER_MS_Q: ModelConfig(
+        N=160,
+        M=256,
+        Z=160,
+        quant_step=0.35,
+        decoder_channels=320,
+        decoder_res_blocks=4,
+        refinement_blocks=6,
+        name=MODEL_VARIANT_HYPER_MS_Q,
+        model_variant=MODEL_VARIANT_HYPER_MS_Q,
+        model_type="mean_scale_hyperprior",
+        encoder_type="residual_quant_friendly_signed",
+        activation="relu6",
+        encoder_norm="none",
+        latent_clip=6.0,
+        signed_latent=True,
+        z_clip=6.0,
+        scale_min=1e-3,
+        scale_max=20.0,
+    ),
+    MODEL_VARIANT_HYPER_MS_Q_NANO: ModelConfig(
+        N=128,
+        M=192,
+        Z=128,
+        quant_step=0.38,
+        decoder_channels=256,
+        decoder_res_blocks=4,
+        refinement_blocks=6,
+        name=MODEL_VARIANT_HYPER_MS_Q_NANO,
+        model_variant=MODEL_VARIANT_HYPER_MS_Q_NANO,
+        model_type="mean_scale_hyperprior",
+        encoder_type="residual_quant_friendly_signed",
+        activation="relu6",
+        encoder_norm="none",
+        latent_clip=6.0,
+        signed_latent=True,
         z_clip=6.0,
         scale_min=1e-3,
         scale_max=20.0,
@@ -225,7 +269,13 @@ class QuantResidualBlock(nn.Module):
 class DownsampleResidualBlock(nn.Module):
     """Stride-2 residual downsampler with an explicit 1x1 skip branch."""
 
-    def __init__(self, in_channels: int, out_channels: int, activation: str = "relu6") -> None:
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        activation: str = "relu6",
+        output_activation: bool = True,
+    ) -> None:
         super().__init__()
         self.main = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=2, padding=1),
@@ -233,7 +283,7 @@ class DownsampleResidualBlock(nn.Module):
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
         )
         self.skip = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=2)
-        self.out_act = make_activation(activation)
+        self.out_act = make_activation(activation) if output_activation else nn.Identity()
 
     def forward(self, x: Tensor) -> Tensor:
         return self.out_act(self.main(x) + self.skip(x))
@@ -248,16 +298,23 @@ class QuantFriendlyResidualEncoder(nn.Module):
         M: int = 160,
         activation: str = "relu6",
         latent_clip: float | None = 6.0,
+        signed_latent: bool = True,
     ) -> None:
         super().__init__()
         self.latent_clip = latent_clip
+        self.signed_latent = bool(signed_latent)
         self.down1 = DownsampleResidualBlock(3, N, activation=activation)
         self.res1 = QuantResidualBlock(N, activation=activation)
         self.down2 = DownsampleResidualBlock(N, N, activation=activation)
         self.res2 = QuantResidualBlock(N, activation=activation)
         self.down3 = DownsampleResidualBlock(N, N, activation=activation)
         self.res3 = QuantResidualBlock(N, activation=activation)
-        self.down4 = DownsampleResidualBlock(N, M, activation=activation)
+        self.down4 = DownsampleResidualBlock(
+            N,
+            M,
+            activation=activation,
+            output_activation=not self.signed_latent,
+        )
 
     def forward(self, x: Tensor) -> Tensor:
         x = self.res1(self.down1(x))
@@ -321,8 +378,41 @@ class HyperDecoder(nn.Module):
         return self.make_positive_scale(self.net(z_hat))
 
 
+class HyperMeanScaleDecoder(nn.Module):
+    """Lightweight h_s head: z_hat -> (scales_y, means_y)."""
+
+    def __init__(
+        self,
+        Z: int,
+        N: int,
+        M: int,
+        activation: str = "relu6",
+        scale_min: float = 1e-3,
+        scale_max: float = 20.0,
+    ) -> None:
+        super().__init__()
+        self.scale_min = float(scale_min)
+        self.scale_max = float(scale_max)
+        self.net = nn.Sequential(
+            deconv(Z, N, kernel_size=3, stride=2),
+            make_activation(activation),
+            deconv(N, N, kernel_size=3, stride=2),
+            make_activation(activation),
+            nn.Conv2d(N, 2 * M, kernel_size=3, padding=1),
+        )
+
+    def make_positive_scale(self, raw: Tensor) -> Tensor:
+        scale = F.softplus(raw) + self.scale_min
+        return scale.clamp(self.scale_min, self.scale_max)
+
+    def forward(self, z_hat: Tensor) -> tuple[Tensor, Tensor]:
+        raw = self.net(z_hat)
+        raw_scales, means = raw.chunk(2, dim=1)
+        return self.make_positive_scale(raw_scales), means
+
+
 class GaussianConditionalEntropy(nn.Module):
-    """Scale-only Gaussian conditional entropy model for y."""
+    """Gaussian conditional entropy model for y with optional mean prediction."""
 
     def __init__(
         self,
@@ -343,25 +433,29 @@ class GaussianConditionalEntropy(nn.Module):
         self,
         y: Tensor,
         scales_y: Tensor,
+        means_y: Tensor | None = None,
         training: bool | None = None,
     ) -> tuple[Tensor, Tensor]:
         if training is None:
             training = self.training
         step = self._step_like(y)
+        means = self._means_like(y, means_y)
         if training:
             y_hat = y + (torch.rand_like(y) - 0.5) * step
         else:
-            y_hat = self.quantize(y).to(dtype=y.dtype) * step
-        likelihoods = self._likelihood(y_hat, scales_y)
+            y_hat = self.quantize(y, means_y).to(dtype=y.dtype) * step + means
+        likelihoods = self._likelihood(y_hat, scales_y, means_y)
         return y_hat, likelihoods
 
-    def quantize(self, y: Tensor) -> Tensor:
+    def quantize(self, y: Tensor, means_y: Tensor | None = None) -> Tensor:
         step = self._step_like(y)
-        return torch.round(y / step).to(torch.int32)
+        means = self._means_like(y, means_y)
+        return torch.round((y - means) / step).to(torch.int32)
 
     def dequantize(
         self,
         symbols: Tensor,
+        means_y: Tensor | None = None,
         quant_step: float | Tensor | None = None,
         dtype: torch.dtype = torch.float32,
         device: torch.device | str | None = None,
@@ -373,16 +467,26 @@ class GaussianConditionalEntropy(nn.Module):
             step = self.quant_step.to(device=device, dtype=dtype)
         else:
             step = torch.as_tensor(quant_step, dtype=dtype, device=device)
-        return symbols * step
+        means = 0.0
+        if means_y is not None:
+            means = means_y.to(device=device, dtype=dtype)
+        return symbols * step + means
 
-    def _likelihood(self, y_hat: Tensor, scales_y: Tensor) -> Tensor:
+    def _likelihood(
+        self,
+        y_hat: Tensor,
+        scales_y: Tensor,
+        means_y: Tensor | None = None,
+    ) -> Tensor:
         step = self._step_like(y_hat)
+        means = self._means_like(y_hat, means_y)
         scales = scales_y.to(device=y_hat.device, dtype=y_hat.dtype).clamp(
             self.scale_min,
             self.scale_max,
         )
-        upper = self._standardized_cumulative((y_hat + 0.5 * step) / scales)
-        lower = self._standardized_cumulative((y_hat - 0.5 * step) / scales)
+        centered = y_hat - means
+        upper = self._standardized_cumulative((centered + 0.5 * step) / scales)
+        lower = self._standardized_cumulative((centered - 0.5 * step) / scales)
         return (upper - lower).clamp_min(self.likelihood_bound)
 
     @staticmethod
@@ -391,6 +495,12 @@ class GaussianConditionalEntropy(nn.Module):
 
     def _step_like(self, tensor: Tensor) -> Tensor:
         return self.quant_step.to(device=tensor.device, dtype=tensor.dtype)
+
+    @staticmethod
+    def _means_like(tensor: Tensor, means_y: Tensor | None = None) -> Tensor:
+        if means_y is None:
+            return tensor.new_zeros(())
+        return means_y.to(device=tensor.device, dtype=tensor.dtype)
 
 
 class ResidualBlock(nn.Module):
@@ -619,6 +729,7 @@ class NanoHyperResidualQ(nn.Module):
             M=self.M,
             activation=activation,
             latent_clip=config.latent_clip,
+            signed_latent=config.signed_latent,
         )
         self.hyper_encoder = HyperEncoder(
             M=self.M,
@@ -781,6 +892,213 @@ class NanoHyperResidualQ(nn.Module):
         )
 
 
+class NanoHyperMeanScaleQ(nn.Module):
+    """Nano/mini mean-scale hyperprior codec prepared for RKNN mixed precision."""
+
+    supports_cnz_v4 = False
+
+    def __init__(
+        self,
+        model_variant: str = MODEL_VARIANT_HYPER_MS_Q,
+        activation: str | None = None,
+        decoder_activation: str = "leaky_relu",
+        clamp_decoder_output: bool = True,
+        qat: QATSettings | None = None,
+    ) -> None:
+        super().__init__()
+        variant = normalize_model_variant(model_variant)
+        config = get_model_config(variant)
+        if config.model_type != "mean_scale_hyperprior":
+            raise ValueError(f"{variant} is not a mean-scale hyperprior config")
+        if activation is None:
+            activation = config.activation
+        if config.Z is None:
+            raise ValueError(f"{variant} requires config.Z")
+
+        self.model_variant = variant
+        self.model_name = config.name
+        self.config = config
+        self.N = config.N
+        self.M = config.M
+        self.Z = int(config.Z)
+        self.decoder_channels = config.decoder_channels
+        self.downsampling_factor = 2**4
+        self.scale_min = float(config.scale_min)
+        self.scale_max = float(config.scale_max)
+        self.latent_clip = config.latent_clip
+        self.z_clip = config.z_clip
+        self.qat = qat if qat is not None else QATSettings()
+
+        self.encoder = QuantFriendlyResidualEncoder(
+            N=self.N,
+            M=self.M,
+            activation=activation,
+            latent_clip=config.latent_clip,
+            signed_latent=config.signed_latent,
+        )
+        self.hyper_encoder = HyperEncoder(
+            M=self.M,
+            N=self.N,
+            Z=self.Z,
+            activation=activation,
+            z_clip=config.z_clip,
+        )
+        self.entropy_bottleneck_z = NanoEntropyBottleneck(
+            channels=self.Z,
+            quant_step=1.0,
+        )
+        self.hyper_decoder = HyperMeanScaleDecoder(
+            Z=self.Z,
+            N=self.N,
+            M=self.M,
+            activation=activation,
+            scale_min=config.scale_min,
+            scale_max=config.scale_max,
+        )
+        self.conditional_entropy_y = GaussianConditionalEntropy(
+            quant_step=config.quant_step,
+            scale_min=config.scale_min,
+            scale_max=config.scale_max,
+        )
+        self.decoder = Decoder(
+            N=self.N,
+            M=self.M,
+            decoder_channels=config.decoder_channels,
+            decoder_res_blocks=config.decoder_res_blocks,
+            refinement_blocks=config.refinement_blocks,
+            activation=decoder_activation,
+            clamp_output=clamp_decoder_output,
+        )
+
+        init_module(self.encoder)
+        init_module(self.hyper_encoder)
+        init_module(self.hyper_decoder)
+        init_module(self.decoder)
+
+    @property
+    def g_a(self) -> QuantFriendlyResidualEncoder:
+        return self.encoder
+
+    @property
+    def h_a(self) -> HyperEncoder:
+        return self.hyper_encoder
+
+    @property
+    def h_s(self) -> HyperMeanScaleDecoder:
+        return self.hyper_decoder
+
+    @property
+    def g_s(self) -> Decoder:
+        return self.decoder
+
+    def model_config_dict(self) -> dict[str, Any]:
+        return model_config_to_dict(self.config)
+
+    def set_qat_settings(self, qat: QATSettings) -> None:
+        self.qat = qat
+
+    def set_quant_step(self, quant_step: float) -> None:
+        self.conditional_entropy_y.quant_step.fill_(float(quant_step))
+
+    def get_quant_step(self) -> float:
+        return float(self.conditional_entropy_y.quant_step.detach().cpu())
+
+    def analysis_transform(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        y = self.encoder(x)
+        z = self.hyper_encoder(y)
+        z_hat, _ = self.entropy_bottleneck_z(z, training=False)
+        scales_y, means_y = self.hyper_decoder(z_hat)
+        return y, z, scales_y, means_y
+
+    def _maybe_fake_quant_latent(self, y: Tensor) -> tuple[Tensor, Tensor]:
+        if not self.qat.enable_latent_fake_quant:
+            return y, y.new_zeros(())
+        y_q = fake_quant_symmetric_ste(
+            y,
+            bits=self.qat.latent_fake_quant_bits,
+            clip=self.qat.latent_fake_quant_clip,
+        )
+        return y_q, torch.mean(torch.abs(y_q.detach() - y.detach()))
+
+    def _maybe_fake_quant_z(self, z: Tensor) -> tuple[Tensor, Tensor]:
+        if not self.qat.enable_z_fake_quant:
+            return z, z.new_zeros(())
+        z_q = fake_quant_symmetric_ste(
+            z,
+            bits=self.qat.z_fake_quant_bits,
+            clip=self.qat.z_fake_quant_clip,
+        )
+        return z_q, torch.mean(torch.abs(z_q.detach() - z.detach()))
+
+    def _maybe_fake_quant_scale(self, scales: Tensor) -> tuple[Tensor, Tensor]:
+        if not self.qat.enable_scale_fake_quant:
+            return scales, scales.new_zeros(())
+        scales_q = fake_quant_positive_ste(
+            scales,
+            bits=self.qat.scale_fake_quant_bits,
+            clip=self.qat.scale_fake_quant_clip,
+        ).clamp(self.scale_min, self.scale_max)
+        return scales_q, torch.mean(torch.abs(scales_q.detach() - scales.detach()))
+
+    def forward(self, x: Tensor) -> dict[str, Any]:
+        y = self.encoder(x)
+        y_for_hyper, fq_y_error = self._maybe_fake_quant_latent(y)
+        z = self.hyper_encoder(y_for_hyper)
+        z_for_entropy, fq_z_error = self._maybe_fake_quant_z(z)
+        z_hat, z_likelihoods = self.entropy_bottleneck_z(z_for_entropy)
+        scales_y, means_y = self.hyper_decoder(z_hat)
+        scales_y, fq_scale_error = self._maybe_fake_quant_scale(scales_y)
+        y_hat, y_likelihoods = self.conditional_entropy_y(y_for_hyper, scales_y, means_y)
+        x_hat = self.decoder(y_hat)
+        return {
+            "x_hat": x_hat,
+            "y": y,
+            "y_for_hyper": y_for_hyper,
+            "y_hat": y_hat,
+            "z": z,
+            "z_for_entropy": z_for_entropy,
+            "z_hat": z_hat,
+            "scales_y": scales_y,
+            "means_y": means_y,
+            "likelihoods": {"y": y_likelihoods, "z": z_likelihoods},
+            "symbols": {
+                "y": self.conditional_entropy_y.quantize(y_for_hyper, means_y).detach(),
+                "z": self.entropy_bottleneck_z.quantize(z_for_entropy).detach(),
+            },
+            "fake_quant_errors": {
+                "y": fq_y_error,
+                "z": fq_z_error,
+                "scale": fq_scale_error,
+            },
+            "quant_step": self.conditional_entropy_y.quant_step,
+            "latent_clip": self.latent_clip,
+            "z_clip": self.z_clip,
+            "scale_min_value": self.scale_min,
+            "scale_max_value": self.scale_max,
+            "model_variant": self.model_variant,
+        }
+
+    @torch.no_grad()
+    def compress(self, x: Tensor) -> dict[str, object]:
+        del x
+        raise NotImplementedError(
+            "nano_hyper_ms_q training/export is implemented, but CNZ mean-scale "
+            "bitstream support requires a future CNZ5 format with z, means, and y streams."
+        )
+
+    @torch.no_grad()
+    def decompress(
+        self,
+        strings: bytes | list[bytes],
+        shape: tuple[int, int] | None = None,
+    ) -> dict[str, Tensor]:
+        del strings, shape
+        raise NotImplementedError(
+            "nano_hyper_ms_q cannot decode CNZ4 streams. Extend the bitstream to carry "
+            "z, y, means/scales, hyperprior shape, and model_variant before deployment."
+        )
+
+
 def get_model(
     model_variant: str | None = None,
     activation: str | None = None,
@@ -797,6 +1115,14 @@ def get_model(
         )
     if variant == MODEL_VARIANT_HYPER_RESIDUAL_Q:
         return NanoHyperResidualQ(
+            activation=activation,
+            decoder_activation=decoder_activation,
+            clamp_decoder_output=clamp_decoder_output,
+            qat=qat,
+        )
+    if variant in {MODEL_VARIANT_HYPER_MS_Q, MODEL_VARIANT_HYPER_MS_Q_NANO}:
+        return NanoHyperMeanScaleQ(
+            model_variant=variant,
             activation=activation,
             decoder_activation=decoder_activation,
             clamp_decoder_output=clamp_decoder_output,

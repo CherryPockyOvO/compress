@@ -54,14 +54,14 @@ The single retained configuration uses `N=128, M=128`, `quant_step=0.67`,
 Old lower-quality checkpoints are not useful for this code path. Old level-3
 checkpoints can still be loaded manually with `--resume` or `--checkpoint`.
 
-The current high-precision training route is `nano_hyper_residual_q`. It adds a
-quantization-friendly residual encoder, scale-only hyperprior, ReLU6,
-latent/z/scale clipping, and staged QAT fake quant for RKNN mixed precision
-experiments. The three precision stages are `hyper_quality_fp`,
-and `hyper_quality_qat8`. `hyper_quality_fp` is the FP training route that can
-be exported/converted as FP16, and `hyper_quality_qat8` is the INT8 fake-quant
-route. This route does not decode the old `nano` CNZ4 bitstream; CNZ5 support
-is still needed for full hyperprior deployment. See
+The current high-precision training route is `nano_hyper_ms_q`. It follows the
+CompressAI mean-scale hyperprior pattern in a RK3588-friendly mini/nano shape:
+quant-friendly residual transforms, ReLU6 hidden blocks, signed clipped `y`
+latents, and `h_s(z_hat) -> (scales_y, means_y)`. The deployment target is
+mixed precision: main transform INT8/QAT candidates, with the hyperprior
+`z/means/scales` kept FP/FP16. The old `nano_hyper_residual_q` scale-only model
+is retained only as a baseline. This route does not decode the old `nano` CNZ4
+bitstream; CNZ5 support is still needed for full hyperprior deployment. See
 [`docs/nano_hyper_residual_q.md`](docs/nano_hyper_residual_q.md).
 
 ## Export Encoder ONNX
@@ -147,14 +147,14 @@ python val.py --data-dir D:\data\images\test --checkpoint checkpoints\latest.pt 
 
 ### High-Precision Hyperprior Training
 
-Use this as the current high-precision route. It trains
-`nano_hyper_residual_q`, which uses a residual quantization-friendly encoder and
-a scale-only hyperprior:
+Use this as the current high-precision route. It trains `nano_hyper_ms_q`, a
+mean-scale hyperprior model distilled from the official CompressAI high-quality
+route into RK3588-friendly mini/nano widths:
 
 ```text
 x -> residual g_a -> y
-       y -> h_a -> z -> entropy bottleneck -> z_hat -> h_s -> scales_y
-       y + scales_y -> Gaussian conditional entropy -> y_hat -> g_s -> x_hat
+       y -> h_a -> z -> entropy bottleneck -> z_hat -> h_s -> scales_y, means_y
+       y + means_y + scales_y -> Gaussian conditional entropy -> y_hat -> g_s -> x_hat
 ```
 
 This is different from the legacy `detail` route. `detail` keeps the old
@@ -176,51 +176,70 @@ or call the environment tools directly:
 /home/zzw/miniconda3/envs/net/bin/torchrun
 ```
 
-The current precision route has two stages:
+The current precision route has three stages:
 
-1. `hyper_quality_fp`: full-precision baseline training, no fake quant. Export
-   this checkpoint for FP16/RKNN-FP16 experiments.
-2. `hyper_quality_qat8`: 8-bit fake quant fine-tuning for `y`, `z`, and
-   `scales_y`.
+1. `hyper_ms_mini_fp`: FP mean-scale baseline from scratch.
+2. `hyper_ms_mini_hq`: quality-first fine-tune from the FP baseline.
+3. `hyper_ms_mini_qat8`: mixed-QAT fine-tune. It fake-quantizes the main `y`
+   latent to 8 bits and leaves the hyperprior `z`, `means_y`, and `scales_y`
+   in FP/FP16.
 
 Start stage 1 from scratch. Do not initialize from `checkpoints_detail/*.pt`,
 because the old `nano` model uses `M=128` factorized latents while
-`nano_hyper_residual_q` uses `M=160`, `Z=96`, and a hyperprior.
+`nano_hyper_ms_q` uses `M=256`, `Z=160`, and a mean-scale hyperprior.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2 /home/zzw/miniconda3/envs/net/bin/torchrun \
   --standalone \
   --nproc_per_node=3 \
   train.py \
-  --quality-profile hyper_quality_fp \
+  --quality-profile hyper_ms_mini_fp \
   --train-dir data/train \
   --val-dir data/val \
-  --checkpoint-dir checkpoints_hyper_quality_fp \
+  --checkpoint-dir checkpoints_hyper_ms_mini_fp \
   --checkpoint-interval-steps 100 \
   --eval-interval-steps 100 \
   --max-steps 8000 \
-  --num-workers 8
+  --num-workers 4
 ```
 
-After stage 1, continue directly with INT8/QAT8:
+After stage 1, run the quality-first fine-tune:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2 /home/zzw/miniconda3/envs/net/bin/torchrun \
   --standalone \
   --nproc_per_node=3 \
   train.py \
-  --quality-profile hyper_quality_qat8 \
-  --init-checkpoint checkpoints_hyper_quality_fp/best.pt \
+  --quality-profile hyper_ms_mini_hq \
+  --init-checkpoint checkpoints_hyper_ms_mini_fp/best.pt \
   --train-dir data/train \
   --val-dir data/val \
-  --checkpoint-dir checkpoints_hyper_quality_qat8 \
+  --checkpoint-dir checkpoints_hyper_ms_mini_hq \
+  --checkpoint-interval-steps 100 \
+  --eval-interval-steps 100 \
+  --max-steps 3000 \
+  --num-workers 4
+```
+
+Then continue with the mixed INT8/FP16 QAT route:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2 /home/zzw/miniconda3/envs/net/bin/torchrun \
+  --standalone \
+  --nproc_per_node=3 \
+  train.py \
+  --quality-profile hyper_ms_mini_qat8 \
+  --init-checkpoint checkpoints_hyper_ms_mini_hq/best.pt \
+  --train-dir data/train \
+  --val-dir data/val \
+  --checkpoint-dir checkpoints_hyper_ms_mini_qat8 \
   --checkpoint-interval-steps 100 \
   --eval-interval-steps 100 \
   --max-steps 2000 \
-  --num-workers 8
+  --num-workers 4
 ```
 
-In DDP mode `--batch-size` is per GPU. The `hyper_quality_*` presets use
+In DDP mode `--batch-size` is per GPU. The `hyper_ms_mini_*` presets use
 `batch_size=24`, so three GPUs train with an effective global batch of 72.
 With the current local split of about 40001 train images, one epoch is about
 556 optimizer steps. Only rank 0 prints progress and writes `eN.pt`,
@@ -229,10 +248,7 @@ With the current local split of about 40001 train images, one epoch is about
 Encoder-side complexity for a 720p frame padded to `768x1280`:
 
 ```text
-encoder_y:        2,096,224 params, 157.888 GMACs, 315.776 GFLOPs
-analysis_y_z_s:   2,981,728 params, 159.640 GMACs, 319.280 GFLOPs
-FP16 param size:  3.998 MiB encoder_y, 5.687 MiB analysis
-INT8 param size:  1.999 MiB encoder_y, 2.844 MiB analysis
+Run tools/encoder_complexity.py after choosing mini or nano width.
 ```
 
 Recalculate with:
@@ -244,19 +260,19 @@ Recalculate with:
 Export the high-precision analysis model after training:
 
 ```bash
-/home/zzw/miniconda3/envs/net/bin/python tools/export_encoder_onnx.py --checkpoint checkpoints_hyper_quality_fp/best.pt --output encoder_hyper_fp16_y.onnx --height 768 --width 1280
-/home/zzw/miniconda3/envs/net/bin/python tools/export_encoder_onnx.py --checkpoint checkpoints_hyper_quality_qat8/best.pt --output encoder_hyper_int8_y.onnx --height 768 --width 1280
-/home/zzw/miniconda3/envs/net/bin/python tools/export_encoder_onnx.py --checkpoint checkpoints_hyper_quality_qat8/best.pt --output analysis_hyper_int8.onnx --export-mode analysis --height 768 --width 1280
+/home/zzw/miniconda3/envs/net/bin/python tools/export_encoder_onnx.py --checkpoint checkpoints_hyper_ms_mini_fp/best.pt --output encoder_hyper_ms_fp16_y.onnx --height 768 --width 1280
+/home/zzw/miniconda3/envs/net/bin/python tools/export_encoder_onnx.py --checkpoint checkpoints_hyper_ms_mini_qat8/best.pt --output encoder_hyper_ms_int8_y.onnx --height 768 --width 1280
+/home/zzw/miniconda3/envs/net/bin/python tools/export_encoder_onnx.py --checkpoint checkpoints_hyper_ms_mini_qat8/best.pt --output analysis_hyper_ms_int8.onnx --export-mode analysis --height 768 --width 1280
 ```
 
 The hyperprior model currently supports training and ONNX/RKNN analysis export.
 It does not yet support CNZ4 encode/decode; full bitstream deployment needs a
-future CNZ5 format carrying both `z` and `y`.
+future CNZ5 format carrying `z`, `y`, and the mean/scale contract.
 
 For a PyTorch reconstruction roundtrip before CNZ5 exists:
 
 ```bash
-/home/zzw/miniconda3/envs/net/bin/python roundtrip_image.py samples/test.jpg --checkpoint checkpoints_hyper_quality_fp/latest.pt --mode forward --output-dir roundtrip_hyper_test --timing
+/home/zzw/miniconda3/envs/net/bin/python roundtrip_image.py samples/test.jpg --checkpoint checkpoints_hyper_ms_mini_fp/latest.pt --mode forward --output-dir roundtrip_hyper_ms_test --timing
 ```
 
 ## RK3588 Deployment Path

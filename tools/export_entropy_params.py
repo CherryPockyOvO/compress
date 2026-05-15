@@ -67,6 +67,8 @@ def main() -> None:
             ),
             "channels_y": int(model.M),
             "channels_z": int(model.Z),
+            "model_type": config.model_type,
+            "has_means_y": bool(config.model_type == "mean_scale_hyperprior"),
             "quant_step_y": float(model.conditional_entropy_y.quant_step.detach().cpu()),
             "quant_step_z": float(z_entropy.quant_step.detach().cpu()),
             "downsampling_factor": int(model.downsampling_factor),

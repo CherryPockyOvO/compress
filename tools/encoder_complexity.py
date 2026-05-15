@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from compressai_nano import MODEL_CONFIGS, MODEL_VARIANT_HYPER_RESIDUAL_Q, MODEL_VARIANT_NANO, get_model
+from compressai_nano import MODEL_CONFIGS, MODEL_VARIANT_HYPER_MS_Q, MODEL_VARIANT_NANO, get_model
 
 
 @dataclass
@@ -34,7 +34,7 @@ class AnalysisWrapper(nn.Module):
         super().__init__()
         self.model = model
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
         if not hasattr(self.model, "analysis_transform"):
             y = self.model.encoder(x)
             zeros = y.new_zeros(1)
@@ -142,7 +142,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-variant",
         choices=tuple(MODEL_CONFIGS.keys()),
-        default=MODEL_VARIANT_HYPER_RESIDUAL_Q,
+        default=MODEL_VARIANT_HYPER_MS_Q,
     )
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--width", type=int, default=1280)
@@ -151,7 +151,7 @@ def parse_args() -> argparse.Namespace:
         "--mode",
         choices=("encoder", "analysis", "both"),
         default="both",
-        help="encoder counts image->y. analysis counts image->(y,z,scales_y).",
+        help="encoder counts image->y. analysis counts image->(y,z,scales_y[,means_y]).",
     )
     parser.add_argument(
         "--details",
@@ -171,7 +171,12 @@ def main() -> None:
     if args.mode in {"encoder", "both"}:
         modules.append(("encoder_y", model.encoder))
     if args.mode in {"analysis", "both"}:
-        analysis_name = "analysis_y_z_scales"
+        config = MODEL_CONFIGS[args.model_variant]
+        analysis_name = (
+            "analysis_y_z_scales_means"
+            if config.model_type == "mean_scale_hyperprior"
+            else "analysis_y_z_scales"
+        )
         if args.model_variant == MODEL_VARIANT_NANO:
             analysis_name = "analysis_y_only"
         modules.append((analysis_name, AnalysisWrapper(model)))

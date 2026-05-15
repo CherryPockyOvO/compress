@@ -22,6 +22,8 @@ from tqdm import tqdm
 
 from compressai_nano import (
     MODEL_CONFIGS,
+    MODEL_VARIANT_HYPER_MS_Q,
+    MODEL_VARIANT_HYPER_MS_Q_NANO,
     MODEL_VARIANT_HYPER_RESIDUAL_Q,
     MODEL_VARIANT_NANO,
     QATSettings,
@@ -139,6 +141,158 @@ TRAIN_PROFILES = {
         "symbol_range_weight": 0.001,
         "scale_range_weight": 0.001,
     },
+    "hyper_ms_mini_fp": {
+        "model_variant": MODEL_VARIANT_HYPER_MS_Q,
+        "lmbda": OFFICIAL_MSE_LAMBDA_Q7,
+        "rate_weight": 1.0,
+        "target_bpp": None,
+        "ssim_weight": 0.03,
+        "detail_weight": 0.8,
+        "highlight_weight": 0.6,
+        "highlight_under_weight": 1.0,
+        "highlight_lap_weight": 0.8,
+        "texture_lap_weight": 1.0,
+        "texture_contrast_weight": 0.4,
+        "l1_weight": 0.04,
+        "lpips_weight": 0.0,
+        "lpips_net": "alex",
+        "quant_step": 0.35,
+        "epochs": 120,
+        "batch_size": 12,
+        "crop_size": 384,
+        "lr": 1e-4,
+        "enable_latent_fake_quant": False,
+        "enable_z_fake_quant": False,
+        "enable_scale_fake_quant": False,
+        "latent_range_weight": 0.0,
+        "z_range_weight": 0.0,
+        "symbol_range_weight": 0.0,
+        "scale_range_weight": 0.0,
+    },
+    "hyper_ms_mini_hq": {
+        "model_variant": MODEL_VARIANT_HYPER_MS_Q,
+        "lmbda": 0.16,
+        "rate_weight": 0.08,
+        "target_bpp": 2.80,
+        "ssim_weight": 0.03,
+        "detail_weight": 1.3,
+        "highlight_weight": 1.4,
+        "highlight_under_weight": 1.3,
+        "highlight_lap_weight": 1.2,
+        "texture_lap_weight": 1.5,
+        "texture_contrast_weight": 0.7,
+        "l1_weight": 0.08,
+        "lpips_weight": 0.0003,
+        "lpips_net": "alex",
+        "quant_step": 0.30,
+        "epochs": 30,
+        "batch_size": 12,
+        "crop_size": 384,
+        "lr": 5e-6,
+        "enable_latent_fake_quant": False,
+        "enable_z_fake_quant": False,
+        "enable_scale_fake_quant": False,
+        "latent_range_weight": 0.002,
+        "z_range_weight": 0.0,
+        "symbol_range_weight": 0.0002,
+        "scale_range_weight": 0.0,
+    },
+    "hyper_ms_mini_qat8": {
+        "model_variant": MODEL_VARIANT_HYPER_MS_Q,
+        "lmbda": 0.16,
+        "rate_weight": 0.05,
+        "target_bpp": 2.80,
+        "ssim_weight": 0.03,
+        "detail_weight": 1.3,
+        "highlight_weight": 1.4,
+        "highlight_under_weight": 1.3,
+        "highlight_lap_weight": 1.2,
+        "texture_lap_weight": 1.5,
+        "texture_contrast_weight": 0.7,
+        "l1_weight": 0.08,
+        "lpips_weight": 0.0003,
+        "lpips_net": "alex",
+        "quant_step": 0.30,
+        "epochs": 30,
+        "batch_size": 12,
+        "crop_size": 384,
+        "lr": 3e-6,
+        "enable_latent_fake_quant": True,
+        "latent_fake_quant_bits": 8,
+        "latent_fake_quant_clip": 6.0,
+        "enable_z_fake_quant": False,
+        "z_fake_quant_bits": 8,
+        "z_fake_quant_clip": 6.0,
+        "enable_scale_fake_quant": False,
+        "scale_fake_quant_bits": 8,
+        "scale_fake_quant_clip": 8.0,
+        "latent_range_weight": 0.005,
+        "z_range_weight": 0.0,
+        "symbol_range_weight": 0.0005,
+        "scale_range_weight": 0.0,
+    },
+    "hyper_ms_nano_fp": {
+        "model_variant": MODEL_VARIANT_HYPER_MS_Q_NANO,
+        "lmbda": OFFICIAL_MSE_LAMBDA_Q7,
+        "rate_weight": 1.0,
+        "target_bpp": None,
+        "ssim_weight": 0.03,
+        "detail_weight": 0.8,
+        "highlight_weight": 0.6,
+        "highlight_under_weight": 1.0,
+        "highlight_lap_weight": 0.8,
+        "texture_lap_weight": 1.0,
+        "texture_contrast_weight": 0.4,
+        "l1_weight": 0.04,
+        "lpips_weight": 0.0,
+        "lpips_net": "alex",
+        "quant_step": 0.38,
+        "epochs": 120,
+        "batch_size": 18,
+        "crop_size": 384,
+        "lr": 1e-4,
+        "enable_latent_fake_quant": False,
+        "enable_z_fake_quant": False,
+        "enable_scale_fake_quant": False,
+        "latent_range_weight": 0.0,
+        "z_range_weight": 0.0,
+        "symbol_range_weight": 0.0,
+        "scale_range_weight": 0.0,
+    },
+    "hyper_ms_nano_qat8": {
+        "model_variant": MODEL_VARIANT_HYPER_MS_Q_NANO,
+        "lmbda": 0.14,
+        "rate_weight": 0.06,
+        "target_bpp": 2.40,
+        "ssim_weight": 0.03,
+        "detail_weight": 1.2,
+        "highlight_weight": 1.2,
+        "highlight_under_weight": 1.2,
+        "highlight_lap_weight": 1.0,
+        "texture_lap_weight": 1.3,
+        "texture_contrast_weight": 0.6,
+        "l1_weight": 0.07,
+        "lpips_weight": 0.0003,
+        "lpips_net": "alex",
+        "quant_step": 0.33,
+        "epochs": 30,
+        "batch_size": 18,
+        "crop_size": 384,
+        "lr": 3e-6,
+        "enable_latent_fake_quant": True,
+        "latent_fake_quant_bits": 8,
+        "latent_fake_quant_clip": 6.0,
+        "enable_z_fake_quant": False,
+        "z_fake_quant_bits": 8,
+        "z_fake_quant_clip": 6.0,
+        "enable_scale_fake_quant": False,
+        "scale_fake_quant_bits": 8,
+        "scale_fake_quant_clip": 8.0,
+        "latent_range_weight": 0.005,
+        "z_range_weight": 0.0,
+        "symbol_range_weight": 0.0005,
+        "scale_range_weight": 0.0,
+    },
 }
 
 
@@ -235,6 +389,13 @@ BASE_METRIC_KEYS = [
     "scale_std",
     "scale_p01",
     "scale_p99",
+    "mean_y_min",
+    "mean_y_max",
+    "mean_y_mean",
+    "mean_y_std",
+    "mean_y_p01",
+    "mean_y_p99",
+    "mean_y_clip_ratio",
     "symbol_y_min",
     "symbol_y_max",
     "symbol_y_std",
@@ -537,7 +698,7 @@ class ToTensor:
 
 def make_train_transform(crop_size: int, quality_profile: str = "balanced") -> Compose:
     crop: Callable[[Image.Image], Image.Image]
-    if quality_profile == "detail" or quality_profile.startswith("hyper_quality"):
+    if quality_profile == "detail" or quality_profile.startswith(("hyper_quality", "hyper_ms")):
         crop = DetailAwareRandomCrop(crop_size, p_detail=0.3)
     else:
         crop = RandomCrop(crop_size)
@@ -1022,6 +1183,7 @@ class RateDistortionLoss(nn.Module):
         y = output.get("y")
         z = output.get("z")
         scales_y = output.get("scales_y")
+        means_y = output.get("means_y")
         symbols = output.get("symbols", {})
         symbol_y = symbols.get("y") if isinstance(symbols, dict) else None
         symbol_z = symbols.get("z") if isinstance(symbols, dict) else None
@@ -1099,6 +1261,7 @@ class RateDistortionLoss(nn.Module):
         result.update(tensor_stats(y, "latent_y", clip=y_clip))
         result.update(tensor_stats(z, "latent_z", clip=z_clip))
         result.update(scale_stats(scales_y))
+        result.update(tensor_stats(means_y, "mean_y"))
         result.update(symbol_stats(symbol_y, "symbol_y"))
         result.update(symbol_stats(symbol_z, "symbol_z"))
         fake_quant_errors = output.get("fake_quant_errors", {})
@@ -1314,10 +1477,21 @@ def format_detail_metrics(
             [
                 f"y_p99={metrics[key('latent_y_p99')]:.2f}",
                 f"sym_y_p99={metrics[key('symbol_y_p99_abs')]:.1f}",
+                f"y_clip={100.0 * metrics.get(key('latent_y_clip_ratio'), 0.0):.2f}%",
+            ]
+        )
+    if key("latent_z_p99") in metrics and metrics.get(key("latent_z_p99"), 0.0) != 0.0:
+        parts.extend(
+            [
+                f"z_p99={metrics[key('latent_z_p99')]:.2f}",
+                f"sym_z_p99={metrics[key('symbol_z_p99_abs')]:.1f}",
+                f"z_clip={100.0 * metrics.get(key('latent_z_clip_ratio'), 0.0):.2f}%",
             ]
         )
     if metrics.get(key("scale_mean"), 0.0) > 0.0:
         parts.append(f"scale_mean={metrics[key('scale_mean')]:.3f}")
+    if key("mean_y_std") in metrics and metrics.get(key("mean_y_std"), 0.0) > 0.0:
+        parts.append(f"mean_y_std={metrics[key('mean_y_std')]:.3f}")
     if metrics.get(key("fake_quant_y_error"), 0.0) > 0.0:
         parts.append(f"fq_y={metrics[key('fake_quant_y_error')]:.5f}")
     if include_lpips or metrics.get(key("lpips_loss"), 0.0) > 0.0:
@@ -1405,7 +1579,7 @@ def print_run_config(
         f"texture_contrast={args.texture_contrast_weight:g} l1={args.l1_weight:g} "
         f"lpips={lpips_text} quant_step={quant_step:g}"
     )
-    if args.model_variant == MODEL_VARIANT_HYPER_RESIDUAL_Q:
+    if args.model_variant != MODEL_VARIANT_NANO:
         print(
             "  qat: "
             f"latent={args.enable_latent_fake_quant}/{args.latent_fake_quant_bits}b "
@@ -1645,7 +1819,10 @@ def parse_args() -> argparse.Namespace:
         "--quality-profile",
         choices=tuple(TRAIN_PROFILES.keys()),
         default="balanced",
-        help="Training preset. detail is the legacy nano detail preset; hyper_quality_* uses the hyperprior model.",
+        help=(
+            "Training preset. detail is the legacy nano profile; hyper_quality_* "
+            "is the scale-only hyperprior baseline; hyper_ms_* is the mean-scale route."
+        ),
     )
     parser.add_argument(
         "--model-variant",

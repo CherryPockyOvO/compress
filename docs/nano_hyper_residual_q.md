@@ -1,14 +1,15 @@
-# nano_hyper_residual_q
+# nano_hyper_ms_q
 
-`nano_hyper_residual_q` is an independent high-precision model variant for the
-existing nano codec project. The default model is still `nano`; this variant is
-enabled only with `--model-variant nano_hyper_residual_q` or with one of the
-`hyper_quality_*` training profiles.
+`nano_hyper_ms_q` is the current high-precision hyperprior route. It keeps the
+project's lightweight deployment goals, but follows the official CompressAI
+mean-scale hyperprior shape instead of the earlier scale-only experiment. The
+old `nano_hyper_residual_q` model is retained as a baseline through the
+`hyper_quality_*` profiles; new high-precision work should use `hyper_ms_*`.
 
 For the current high-precision training route, start with
 [`high_precision_training.md`](high_precision_training.md). That runbook trains
-this `nano_hyper_residual_q` model through `hyper_quality_fp` and
-`hyper_quality_qat8`.
+`nano_hyper_ms_q` through `hyper_ms_mini_fp`, `hyper_ms_mini_hq`, and
+`hyper_ms_mini_qat8`.
 
 ## Goals
 
@@ -16,8 +17,10 @@ this `nano_hyper_residual_q` model through `hyper_quality_fp` and
   contrast over the lightweight factorized nano model.
 - Keep the RK3588 analysis side friendly to NPU quantization and mixed
   precision.
-- Support staged QAT for latent, hyper-latent, and scale tensors without forcing
-  every intermediate activation through fake quant.
+- Support quality-first mixed QAT: fake-quantize the main `y` latent while
+  keeping the hyperprior `z`, `means_y`, and `scales_y` in FP/FP16.
+- Keep ReLU6 in the hidden INT8-friendly encoder blocks while using a signed
+  clipped final `y` latent output for better PSNR headroom.
 - Prepare clean ONNX exports for RKNN hybrid quantization experiments.
 
 ## Differences From `nano`
@@ -28,17 +31,18 @@ this `nano_hyper_residual_q` model through `hyper_quality_fp` and
 x -> g_a -> y -> factorized entropy -> y_hat -> g_s -> x_hat
 ```
 
-`nano_hyper_residual_q` adds a residual encoder and a scale-only hyperprior:
+`nano_hyper_ms_q` adds a residual encoder and a mean-scale hyperprior:
 
 ```text
 x -> g_a -> y
-       y -> h_a -> z -> entropy bottleneck -> z_hat -> h_s -> scales_y
-       y + scales_y -> Gaussian conditional entropy -> y_hat -> g_s -> x_hat
+       y -> h_a -> z -> entropy bottleneck -> z_hat -> h_s -> scales_y, means_y
+       y + means_y + scales_y -> centered Gaussian conditional -> y_hat -> g_s -> x_hat
 ```
 
-The first hyperprior version predicts scales only. Mean prediction is reserved
-for a later version because mean errors are more sensitive during INT8/mixed
-precision deployment.
+The older `nano_hyper_residual_q` route predicts scales only and is kept as a
+comparison baseline. The new main route predicts means and scales so high bpp
+can be converted into useful reconstruction quality instead of only wider
+scale estimates.
 
 ## Residual Encoder
 
@@ -50,12 +54,12 @@ The analysis transform uses RKNN-friendly blocks:
 - No BatchNorm in the new encoder.
 - `latent_clip * tanh(y / latent_clip)` with default `latent_clip=6.0`.
 
-Recommended config:
+Recommended mini config:
 
 ```text
-N=128, M=160, Z=96
-quant_step=0.45
-decoder_channels=256
+N=160, M=256, Z=160
+quant_step=0.35 FP / 0.30 HQ-QAT
+decoder_channels=320
 decoder_res_blocks=4
 refinement_blocks=6
 activation=relu6
@@ -66,11 +70,15 @@ scale_min=1e-3
 scale_max=20.0
 ```
 
-## Scale-Only Hyperprior
+The narrower speed config is `nano_hyper_ms_q_nano` with
+`N=128, M=192, Z=128`.
+
+## Mean-Scale Hyperprior
 
 `h_a` maps `y -> z`; `z` is clipped with `z_clip * tanh(z / z_clip)`.
 
-`h_s` maps `z_hat -> scales_y`; scales use:
+`h_s` maps `z_hat -> (scales_y, means_y)`. Means are raw Conv outputs. Scales
+use:
 
 ```python
 scale = softplus(raw) + scale_min
@@ -83,14 +91,13 @@ heavy attention.
 
 ## QAT
 
-QAT is disabled by default. The first implementation fake-quantizes only:
+QAT is disabled for FP profiles. The mean-scale mixed-QAT profile fake-quantizes
+only:
 
-- `y` latent,
-- `z` hyper-latent,
-- `scales_y`.
+- `y` latent.
 
-It does not fake-quantize every activation. This keeps FP training stable and
-lets RKNN mixed precision decide which Conv/residual layers should become INT8.
+It keeps `z`, `means_y`, and `scales_y` in FP/FP16. This keeps the hyperprior
+stable while the main transform learns the INT8 deployment error.
 
 Available fake-quant flags:
 
@@ -133,37 +140,49 @@ entropy coding and reconstruction.
 
 ## Training Flow
 
-Stage 1: FP training. Export this checkpoint for FP16/RKNN-FP16 experiments.
+Stage 1: FP mean-scale training. Export this checkpoint for FP16/RKNN-FP16
+experiments.
 
 ```bash
 python train.py \
-  --quality-profile hyper_quality_fp \
+  --quality-profile hyper_ms_mini_fp \
   --train-dir data/train \
   --val-dir data/val \
-  --checkpoint-dir checkpoints_hyper_quality_fp
+  --checkpoint-dir checkpoints_hyper_ms_mini_fp
 ```
 
-Stage 2: QAT8 fine-tuning
+Stage 2: quality fine-tuning
 
 ```bash
 python train.py \
-  --quality-profile hyper_quality_qat8 \
+  --quality-profile hyper_ms_mini_hq \
   --train-dir data/train \
   --val-dir data/val \
-  --init-checkpoint checkpoints_hyper_quality_fp/best.pt \
-  --checkpoint-dir checkpoints_hyper_quality_qat8
+  --init-checkpoint checkpoints_hyper_ms_mini_fp/best.pt \
+  --checkpoint-dir checkpoints_hyper_ms_mini_hq
+```
+
+Stage 3: mixed INT8/FP16 QAT fine-tuning
+
+```bash
+python train.py \
+  --quality-profile hyper_ms_mini_qat8 \
+  --train-dir data/train \
+  --val-dir data/val \
+  --init-checkpoint checkpoints_hyper_ms_mini_hq/best.pt \
+  --checkpoint-dir checkpoints_hyper_ms_mini_qat8
 ```
 
 Stage 3: RKNN mixed precision exploration
 
 1. Export FP ONNX.
 2. Convert FP RKNN and confirm quality.
-3. Convert the QAT8/INT8 path as the quantized target.
+3. Convert the mixed-QAT path as the quantized target.
 4. Use RKNN hybrid quantization where needed:
    - ordinary Conv/residual layers INT8,
-   - `y` output FP16,
+   - signed `y` latent fake-quantized during training,
    - `z` output FP16,
-   - `h_s` and `scales_y` FP16.
+   - `h_s`, `means_y`, and `scales_y` FP16.
 5. Compare PyTorch, RKNN FP, and RKNN mixed latent statistics and reconstructions.
 
 ## ONNX Export
@@ -172,18 +191,18 @@ Export only `image -> y`:
 
 ```bash
 python tools/export_encoder_onnx.py \
-  --checkpoint checkpoints_hyper_quality_qat8/best.pt \
-  --output encoder_hyper_y.onnx \
+  --checkpoint checkpoints_hyper_ms_mini_qat8/best.pt \
+  --output encoder_hyper_ms_y.onnx \
   --height 768 \
   --width 1280
 ```
 
-Export analysis side `image -> y, z, scales_y`:
+Export analysis side `image -> y, z, scales_y, means_y`:
 
 ```bash
 python tools/export_encoder_onnx.py \
-  --checkpoint checkpoints_hyper_quality_qat8/best.pt \
-  --output analysis_hyper.onnx \
+  --checkpoint checkpoints_hyper_ms_mini_qat8/best.pt \
+  --output analysis_hyper_ms.onnx \
   --export-mode analysis \
   --height 768 \
   --width 1280
@@ -197,7 +216,7 @@ Current CNZ4 support remains unchanged and is for the old `nano` model:
 - factorized entropy parameters,
 - zlib/CNZ container.
 
-`nano_hyper_residual_q` does not yet support full CNZ deployment. It needs a
+`nano_hyper_ms_q` does not yet support full CNZ deployment. It needs a
 new bitstream version, suggested as CNZ5, with:
 
 - `model_variant` in the header,
@@ -205,8 +224,8 @@ new bitstream version, suggested as CNZ5, with:
 - `y` stream,
 - `z` entropy parameters,
 - hyperprior shape,
-- decoder-side `h_s(z_hat)` to reconstruct `scales_y`,
-- conditional y decoding with `scales_y`.
+- decoder-side `h_s(z_hat)` to reconstruct `means_y` and `scales_y`,
+- conditional y decoding with `means_y` and `scales_y`.
 
 Until CNZ5 exists, use this variant for PyTorch training, ONNX export, RKNN FP
 validation, and RKNN mixed precision analysis-side experiments.

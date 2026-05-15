@@ -94,10 +94,13 @@ def main() -> None:
         y = model.encoder(x).detach().cpu().contiguous()
         analysis = None
         if args.dump_analysis_json and hasattr(model, "analysis_transform"):
-            y_live, z_live, scales_live = model.analysis_transform(x)
+            analysis_outputs = model.analysis_transform(x)
+            y_live, z_live, scales_live = analysis_outputs[:3]
+            means_live = analysis_outputs[3] if len(analysis_outputs) > 3 else None
             analysis = {
                 "z_shape": [int(v) for v in z_live.shape],
                 "scales_y_shape": [int(v) for v in scales_live.shape],
+                "means_y_shape": [int(v) for v in means_live.shape] if means_live is not None else [],
                 "y_min": float(y_live.min().detach().cpu()),
                 "y_max": float(y_live.max().detach().cpu()),
                 "z_min": float(z_live.min().detach().cpu()),
@@ -105,6 +108,9 @@ def main() -> None:
                 "scale_min": float(scales_live.min().detach().cpu()),
                 "scale_max": float(scales_live.max().detach().cpu()),
             }
+            if means_live is not None:
+                analysis["mean_min"] = float(means_live.min().detach().cpu())
+                analysis["mean_max"] = float(means_live.max().detach().cpu())
     args.output.parent.mkdir(parents=True, exist_ok=True)
     y.numpy().astype("<f4", copy=False).tofile(args.output)
     if not args.no_meta:

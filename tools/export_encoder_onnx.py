@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from compressai_nano import get_model, infer_model_variant_from_checkpoint
+from compressai_nano import get_model, get_model_config, infer_model_variant_from_checkpoint
 
 
 class AnalysisExportWrapper(nn.Module):
@@ -19,7 +19,7 @@ class AnalysisExportWrapper(nn.Module):
         super().__init__()
         self.model = model
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
         if not hasattr(self.model, "analysis_transform"):
             y = self.model.encoder(x)
             zeros = y.new_zeros(1)
@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
         "--export-mode",
         choices=("encoder", "analysis"),
         default="encoder",
-        help="encoder exports image->y. analysis exports image->(y,z,scales_y) when supported.",
+        help="encoder exports image->y. analysis exports image->(y,z,scales_y[,means_y]) when supported.",
     )
     parser.add_argument("--height", type=int, default=512)
     parser.add_argument("--width", type=int, default=512)
@@ -60,6 +60,7 @@ def main() -> None:
     args = parse_args()
     raw = torch.load(args.checkpoint, map_location="cpu")
     model_variant = infer_model_variant_from_checkpoint(raw)
+    config = get_model_config(model_variant)
     model = get_model(model_variant=model_variant).eval()
     load_checkpoint(model, args.checkpoint)
     dummy = torch.randn(1, 3, args.height, args.width)
@@ -72,11 +73,15 @@ def main() -> None:
         if args.export_mode == "analysis":
             dynamic_axes["hyper_latent"] = {0: "batch", 2: "hyper_height", 3: "hyper_width"}
             dynamic_axes["scales_y"] = {0: "batch", 2: "latent_height", 3: "latent_width"}
+            if config.model_type == "mean_scale_hyperprior":
+                dynamic_axes["means_y"] = {0: "batch", 2: "latent_height", 3: "latent_width"}
     export_module: nn.Module = model.encoder
     output_names = ["latent"]
     if args.export_mode == "analysis":
         export_module = AnalysisExportWrapper(model)
         output_names = ["latent", "hyper_latent", "scales_y"]
+        if config.model_type == "mean_scale_hyperprior":
+            output_names.append("means_y")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     torch.onnx.export(
         export_module,

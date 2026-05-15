@@ -146,6 +146,7 @@ def forward_reconstruct_image(
     y = output.get("y")
     z = output.get("z")
     scales_y = output.get("scales_y")
+    means_y = output.get("means_y")
 
     return {
         "original_size": original_size,
@@ -153,6 +154,7 @@ def forward_reconstruct_image(
         "latent_shape": tuple(int(v) for v in y.shape) if torch.is_tensor(y) else (),
         "z_shape": tuple(int(v) for v in z.shape) if torch.is_tensor(z) else (),
         "scales_shape": tuple(int(v) for v in scales_y.shape) if torch.is_tensor(scales_y) else (),
+        "means_shape": tuple(int(v) for v in means_y.shape) if torch.is_tensor(means_y) else (),
         "bpp_y": bpp_y,
         "bpp_z": bpp_z,
         "estimated_bpp": bpp_y + bpp_z,
@@ -252,6 +254,7 @@ def main() -> None:
     else:
         print(f"z_shape: {stats['z_shape']}")
         print(f"scales_shape: {stats['scales_shape']}")
+        print(f"means_shape: {stats['means_shape']}")
         print(f"bpp_y: {stats['bpp_y']:.4f}")
         print(f"bpp_z: {stats['bpp_z']:.4f}")
         print(f"estimated_bpp: {stats['estimated_bpp']:.4f}")
