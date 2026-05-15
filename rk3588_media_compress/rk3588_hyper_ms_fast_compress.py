@@ -7,9 +7,9 @@ import json
 import multiprocessing as mp
 import os
 import queue
+import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -19,6 +19,11 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import batch_compress as media_utils  # noqa: E402
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(line_buffering=True)
 
 
 def now_iso() -> str:
@@ -155,6 +160,14 @@ def load_hyper_params(path: Path) -> dict[str, Any]:
     return params
 
 
+def read_rknpu_load() -> str:
+    path = Path("/sys/kernel/debug/rknpu/load")
+    try:
+        return " ".join(path.read_text(encoding="utf-8").split())
+    except Exception:
+        return "npu_load=n/a"
+
+
 def run_entropy_command(job: dict[str, Any], config: dict[str, Any]) -> tuple[str, str]:
     cmd = [
         str(config["hyper_ms_encode_cli"]),
@@ -260,7 +273,8 @@ def npu_worker(
         result_queue.put({"type": "fatal", "worker_id": worker_id, "error": f"load_rknn failed: {ret}"})
         rknn.release()
         return
-    ret = rknn.init_runtime(core_mask=resolve_core_mask(RKNNLite, core_mask_name))
+    core_mask_value = resolve_core_mask(RKNNLite, core_mask_name)
+    ret = rknn.init_runtime(core_mask=core_mask_value)
     if ret != 0:
         result_queue.put({"type": "fatal", "worker_id": worker_id, "error": f"init_runtime failed: {ret}"})
         rknn.release()
@@ -270,6 +284,7 @@ def npu_worker(
             "type": "ready",
             "worker_id": worker_id,
             "core_mask": core_mask_name,
+            "core_mask_value": int(core_mask_value),
             "init_sec": round(time.perf_counter() - init_t0, 4),
         }
     )
@@ -404,6 +419,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--entropy-workers", type=int, default=3)
     parser.add_argument("--entropy-timeout", type=float, default=30.0)
     parser.add_argument("--stall-timeout", type=float, default=45.0)
+    parser.add_argument("--progress-interval", type=float, default=1.0)
     parser.add_argument("--codec", choices=("zlib", "none"), default="zlib")
     parser.add_argument("--zlib-level", type=int, default=1)
     parser.add_argument("--recursive", action="store_true")
@@ -445,17 +461,13 @@ def main() -> None:
             raise FileNotFoundError(f"{label} does not exist: {path}")
 
     hyper_params = load_hyper_params(args.params)
-    temp_context = None
     if args.work_dir is None:
-        if args.keep_intermediate:
-            work_root = args.output / "_work"
-            work_root.mkdir(parents=True, exist_ok=True)
-        else:
-            temp_context = tempfile.TemporaryDirectory(prefix="rk3588_hyper_ms_")
-            work_root = Path(temp_context.name)
+        work_root = args.output / "_work"
+        cleanup_work_root = not args.keep_intermediate
     else:
         work_root = args.work_dir.resolve()
-        work_root.mkdir(parents=True, exist_ok=True)
+        cleanup_work_root = False
+    work_root.mkdir(parents=True, exist_ok=True)
     work_dir = work_root / "npu_outputs"
     work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -467,8 +479,16 @@ def main() -> None:
             raise RuntimeError("no frames to process")
 
         core_masks = media_utils.parse_csv(args.core_masks)
-        worker_core_masks = [core for _ in range(args.workers_per_core) for core in core_masks]
-        worker_count = len(worker_core_masks)
+        worker_specs = [
+            (worker_id, core_index, core)
+            for worker_id, (core_index, core) in enumerate(
+                (core_index, core)
+                for _replica in range(args.workers_per_core)
+                for core_index, core in enumerate(core_masks)
+            )
+        ]
+        worker_core_masks = [core for _worker_id, _core_index, core in worker_specs]
+        worker_count = len(worker_specs)
         manifest = {
             "format": "rk3588-hyper-ms-frame-sequence-v1",
             "created_at": now_iso(),
@@ -500,12 +520,21 @@ def main() -> None:
         print(f"input_type: {source_type}")
         print(f"frames: {len(frames)}")
         print(f"output: {args.output}")
+        print(f"work_dir: {work_root}")
+        if source_type == "video":
+            print("video frames: extracted to disk before NPU processing")
         print(f"npu_workers: {worker_count}, core_masks: {','.join(worker_core_masks)}")
         print(f"entropy_workers: {args.entropy_workers}")
+        if args.workers_per_core > 1:
+            print("warning: --workers-per-core > 1 loads multiple RKNN runtimes per core; use 1 on 4GB boards first.")
         print("tip: default workers bind one persistent process to each NPU core: 0,1,2.")
 
         context = mp.get_context("spawn")
-        task_queue: mp.Queue = context.Queue(maxsize=worker_count * 4)
+        # Frame tasks are only small (index, path) tuples. Keep this unbounded
+        # so the parent immediately enters the result/progress loop. The large
+        # frame images and NPU tensors live on disk and are deleted after CPU
+        # entropy coding.
+        core_task_queues: list[mp.Queue] = [context.Queue(maxsize=0) for _ in core_masks]
         entropy_queue: mp.Queue = context.Queue(maxsize=max(4, args.entropy_workers * 4))
         result_queue: mp.Queue = context.Queue()
 
@@ -531,9 +560,9 @@ def main() -> None:
         npu_workers = [
             context.Process(
                 target=npu_worker,
-                args=(worker_id, core_mask, task_queue, entropy_queue, result_queue, config),
+                args=(worker_id, core_mask, core_task_queues[core_index], entropy_queue, result_queue, config),
             )
-            for worker_id, core_mask in enumerate(worker_core_masks)
+            for worker_id, core_index, core_mask in worker_specs
         ]
         entropy_workers = [
             context.Process(
@@ -546,19 +575,56 @@ def main() -> None:
             proc.start()
 
         for index, frame in enumerate(frames):
-            task_queue.put((index, str(frame)))
-        for _ in npu_workers:
-            task_queue.put(None)
+            core_task_queues[index % len(core_task_queues)].put((index, str(frame)))
+        for core_index, task_queue in enumerate(core_task_queues):
+            for _ in range(args.workers_per_core):
+                task_queue.put(None)
+        print("tasks: queued frame paths to per-core queues; entering progress loop", flush=True)
 
         completed = 0
+        npu_done = 0
         npu_stopped = 0
         entropy_stopped = 0
         fatal = False
+        start_time = time.perf_counter()
         last_result_time = time.perf_counter()
+        last_progress_time = start_time
+        npu_by_core = {core: 0 for core in core_masks}
+        done_by_core = {core: 0 for core in core_masks}
+
+        def queue_size(value: mp.Queue) -> str:
+            try:
+                return str(value.qsize())
+            except (NotImplementedError, OSError):
+                return "?"
+
+        def print_progress(force: bool = False) -> None:
+            nonlocal last_progress_time
+            now = time.perf_counter()
+            if not force and now - last_progress_time < args.progress_interval:
+                return
+            elapsed = max(1e-6, now - start_time)
+            fps = completed / elapsed
+            npu_fps = npu_done / elapsed
+            core_parts = " ".join(
+                f"{core}:npu={npu_by_core.get(core, 0)},done={done_by_core.get(core, 0)}"
+                for core in core_masks
+            )
+            task_q = ",".join(queue_size(item) for item in core_task_queues)
+            print(
+                f"progress: npu={npu_done}/{len(frames)} done={completed}/{len(frames)} "
+                f"npu_fps={npu_fps:.2f} out_fps={fps:.2f} "
+                f"task_q=[{task_q}] entropy_q={queue_size(entropy_queue)} {core_parts} "
+                f"{read_rknpu_load()}",
+                flush=True,
+            )
+            last_progress_time = now
+
         while entropy_stopped < len(entropy_workers):
             try:
                 item = result_queue.get(timeout=1.0)
             except queue.Empty:
+                print_progress()
                 if time.perf_counter() - last_result_time > args.stall_timeout:
                     fatal = True
                     print(f"ERROR: no worker result for {args.stall_timeout:.1f}s; stopping")
@@ -567,22 +633,36 @@ def main() -> None:
             last_result_time = time.perf_counter()
             kind = item.get("type")
             if kind == "ready":
-                print(f"worker ready: id={item['worker_id']} core={item['core_mask']} init={item['init_sec']}s")
+                print(
+                    f"worker ready: id={item['worker_id']} core={item['core_mask']} "
+                    f"mask_value={item.get('core_mask_value')} init={item['init_sec']}s"
+                    ,
+                    flush=True,
+                )
             elif kind == "npu_frame":
+                npu_done += 1
+                npu_by_core[str(item["core_mask"])] = npu_by_core.get(str(item["core_mask"]), 0) + 1
                 manifest["npu_frames"].append(item)
                 print(
                     f"npu {item['index'] + 1}/{len(frames)} "
                     f"core={item['core_mask']} infer={item['npu_inference_sec']:.4f}s"
+                    ,
+                    flush=True,
                 )
+                print_progress()
             elif kind == "frame":
                 completed += 1
+                done_by_core[str(item["core_mask"])] = done_by_core.get(str(item["core_mask"]), 0) + 1
                 manifest["frames"].append(item)
                 print(
                     f"done {completed}/{len(frames)} idx={item['index']} "
                     f"core={item['core_mask']} npu={item['npu_inference_sec']:.4f}s "
                     f"cpu={item['entropy_sec']:.4f}s bytes={item['bytes']}"
+                    ,
+                    flush=True,
                 )
                 write_manifest(manifest_path, manifest)
+                print_progress()
             elif kind == "error":
                 manifest["errors"].append(item)
                 print(f"ERROR frame={item.get('index')} worker={item.get('worker_id')}: {item.get('error')}")
@@ -612,13 +692,14 @@ def main() -> None:
 
         manifest["completed_frames"] = completed
         manifest["finished_at"] = now_iso()
+        print_progress(force=True)
         write_manifest(manifest_path, manifest)
         if fatal or (completed != len(frames) and not args.continue_on_error):
             raise RuntimeError(f"pipeline failed: completed {completed}/{len(frames)} frames")
         print(f"manifest: {manifest_path}")
     finally:
-        if temp_context is not None:
-            temp_context.cleanup()
+        if cleanup_work_root and work_root.exists():
+            shutil.rmtree(work_root, ignore_errors=True)
 
 
 if __name__ == "__main__":
