@@ -22,6 +22,7 @@ dist/
 
 # 排除 Python 緩存
 __pycache__/
+.DS_Store
 *.pyc
 
 # 排除 C++ 構建產物
