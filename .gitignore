@@ -1,7 +1,7 @@
 # 排除權重與日誌
 checkpoints_*/
 *.pt
-!checkpoints_hyper_ms_nano_fp/best.pt
+!./best.pt
 *.log
 
 # 排除數據與圖片
