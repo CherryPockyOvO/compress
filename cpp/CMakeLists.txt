@@ -44,3 +44,6 @@ target_link_libraries(cnz_decode_cli PRIVATE cnz_codec)
 
 add_executable(cnz_benchmark_cli src/cnz_benchmark_cli.cpp)
 target_link_libraries(cnz_benchmark_cli PRIVATE cnz_codec)
+
+add_executable(hyper_ms_encode_cli src/hyper_ms_encode_cli.cpp)
+target_link_libraries(hyper_ms_encode_cli PRIVATE cnz_codec)
