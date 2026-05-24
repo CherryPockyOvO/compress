@@ -11,7 +11,10 @@ data/
 *.cnz
 *.bin
 *.hms
+*.npz
+*.npy
 *.onnx
+*.rknn
 entropy_params.json
 entropy_params2.json
 entropy_params_*.json
@@ -27,3 +30,16 @@ __pycache__/
 
 # 排除 C++ 構建產物
 cpp/build/
+detail/cpp/build/
+hyper/cpp/build/
+
+# 子項目本地產物
+_legacy_root_backup/
+detail/artifacts/
+hyper/artifacts/
+detail/checkpoints*/
+hyper/checkpoints*/
+detail/out*/
+hyper/out*/
+detail/roundtrip*/
+hyper/roundtrip*/
